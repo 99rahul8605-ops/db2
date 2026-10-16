@@ -33,6 +33,7 @@ client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 queue = asyncio.Queue()
 current = None
 operation_lock = asyncio.Lock()
+upload_mode = False
 
 
 def human_size(n):
@@ -178,7 +179,9 @@ async def start_cmd(event):
     if not await admin_only(event): return
     await event.reply(
         '🗄 Hitek Upload Bot\n\n'
-        'Send/forward archive files → queued automatically (one download at a time).\n\n'
+        'Upload mode is OFF by default. Use /upload_on before sending files.\n'
+        'Use /upload_off when finished. Files sent while OFF are ignored.\n\n'
+        '/upload_on - enable file uploads\n/upload_off - disable file uploads\n/upload_status - show upload mode\n'
         '/ping - test bot\n/whoami - IDs\n/queue - queue status\n/files - downloaded files\n'
         '/parts - check .7z parts\n/disk - disk/RAM\n/test7z - test complete archive\n'
         '/info7z - archive info\n/extract7z CONFIRM - extract archive'
@@ -194,6 +197,33 @@ async def ping_cmd(event):
 @client.on(events.NewMessage(pattern=r'^/whoami(?:@\w+)?$'))
 async def whoami_cmd(event):
     await event.reply(f'User ID: `{event.sender_id}`\nChat ID: `{event.chat_id}`\nAdmin: `{event.sender_id in ADMIN_IDS}`')
+
+
+
+
+@client.on(events.NewMessage(pattern=r'^/upload_on(?:@\w+)?$'))
+async def upload_on_cmd(event):
+    global upload_mode
+    if not await admin_only(event): return
+    upload_mode = True
+    await event.reply('🟢 Upload mode ON. Files you send/forward now will be queued one by one.\nWhen finished, use /upload_off.')
+
+
+@client.on(events.NewMessage(pattern=r'^/upload_off(?:@\w+)?$'))
+async def upload_off_cmd(event):
+    global upload_mode
+    if not await admin_only(event): return
+    upload_mode = False
+    await event.reply(f'🔴 Upload mode OFF. New files will be ignored.\nCurrent download: `{current or "-"}`\nWaiting in queue: {queue.qsize()}')
+
+
+@client.on(events.NewMessage(pattern=r'^/upload_status(?:@\w+)?$'))
+async def upload_status_cmd(event):
+    if not await admin_only(event): return
+    await event.reply(
+        f'Upload mode: {"🟢 ON" if upload_mode else "🔴 OFF"}\n'
+        f'Current: `{current or "-"}`\nWaiting: {queue.qsize()}'
+    )
 
 
 @client.on(events.NewMessage(pattern=r'^/queue(?:@\w+)?$'))
@@ -305,6 +335,11 @@ async def file_handler(event):
     if not await admin_only(event): return
     f=event.message.file
     name=safe_name(getattr(f,'name',None) or f'file_{event.message.id}.bin')
+    if not upload_mode:
+        return await event.reply(
+            f'⛔ Upload mode is OFF. `{name}` was NOT queued or downloaded.\n'
+            'Use /upload_on first if you want to upload files.'
+        )
     await queue.put(event)
     await event.reply(f'📥 Queued `{name}`\nSize: {human_size(getattr(f,"size",0))}\nQueue position: {queue.qsize()}')
 
@@ -314,6 +349,7 @@ async def main():
     me=await client.get_me()
     log.info('Started as @%s id=%s', me.username, me.id)
     log.info('ADMIN_IDS=%s', sorted(ADMIN_IDS))
+    log.info('Upload mode starts OFF for safety')
     worker=asyncio.create_task(download_worker())
     for uid in ADMIN_IDS:
         try:

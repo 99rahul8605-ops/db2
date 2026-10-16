@@ -1,33 +1,43 @@
-# Hitek Upload Bot — Simple Telethon build
+# Hitek Upload Bot (Telethon, Safe Upload Mode)
 
-Simple Ubuntu/container setup. No systemd, no /opt install required.
+Simple Ubuntu/container bot for large Telegram files and split 7z archives.
 
-## First setup
+## Safety behavior
+Upload mode is **OFF by default on every restart**.
+
+- `/upload_on` — allow files to be queued/downloaded
+- `/upload_off` — stop accepting new files
+- `/upload_status` — show current state
+
+If a file is sent while upload mode is OFF, it is ignored and not downloaded.
+Files already queued before `/upload_off` continue normally.
+
+## Main commands
+- `/start`
+- `/ping`
+- `/whoami`
+- `/upload_on`
+- `/upload_off`
+- `/upload_status`
+- `/queue`
+- `/files`
+- `/parts`
+- `/disk`
+- `/test7z`
+- `/info7z`
+- `/extract7z CONFIRM`
+
+## Setup
 ```bash
-cd /root/db2
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 cp env.example .env
 nano .env
-./start.sh
+venv/bin/python3 bot.py
 ```
 
-## Background with screen
+## Screen
 ```bash
 screen -dmS hitekbot bash -lc 'cd /root/db2 && ./start.sh'
 screen -r hitekbot
 ```
-Detach: Ctrl+A then D.
-
-## Update from GitHub
-```bash
-cd /root/db2
-git pull
-venv/bin/pip install -r requirements.txt
-screen -S hitekbot -X quit 2>/dev/null || true
-screen -dmS hitekbot bash -lc 'cd /root/db2 && ./start.sh'
-```
-
-Commands: /start /ping /whoami /queue /files /parts /disk /test7z /info7z /extract7z CONFIRM
-
-Files are queued and downloaded one-at-a-time. Live download progress shows percentage, speed and ETA.

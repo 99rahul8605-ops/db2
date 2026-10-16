@@ -1,21 +1,47 @@
-# Hitek Pyrogram Upload Bot
+# Hitek Pyrogram Parallel Upload Bot
 
-Fast large-file Telegram downloader for Ubuntu/container servers using **PyroFork (Pyrogram fork) + TgCrypto**.
+Fast Telegram -> Ubuntu downloader for large split archive parts using **PyroFork + TgCrypto-pyrofork**.
 
-## Main behavior
+## What this build does
 
-- Upload mode starts **OFF** after every bot restart.
-- `/upload_on` enables accepting documents.
-- `/upload_off` blocks accidental new files.
-- Forward files in any order; filenames are preserved.
-- Files are persisted in SQLite queue and downloaded **one at a time**.
-- Interrupted `downloading` jobs are put back into queue on restart.
-- Live per-file percentage, speed and ETA (about every 3 seconds).
-- Downloads use a `.downloading` temp file and atomic rename only after size verification.
-- Already-complete files with the same expected size are skipped.
-- Supports split archives named `hitek.7z.001`, `.002`, etc.
-- 7-Zip test/info/extraction commands included.
+- Upload mode starts **OFF** on every bot restart.
+- `/upload_on` is required before documents are accepted.
+- Forward parts in any order; filenames are preserved.
+- The queue processes **ONE file at a time**.
+- The one active file is downloaded through **4 parallel Telegram ranges** by default.
+- Live combined percentage, speed and ETA.
+- Partial range files are kept on disk after a crash, restart, cancellation or failed transfer.
+- Resume continues from completed **1 MiB chunks** instead of restarting the full file.
+- The final file is only renamed into place after all ranges are complete and the final size matches.
+- `.7z.001`, `.002`, ... integrity/order check and extraction commands are included.
 - No unrestricted shell command is exposed through Telegram.
+
+Build shown by `/version`:
+
+```text
+pyro-parallel4-resume-2026-10-16-3
+```
+
+## Important: one file vs four streams
+
+The queue is still sequential:
+
+```text
+hitek.7z.001  <- active (4 range workers inside this file)
+hitek.7z.002  <- waiting
+hitek.7z.003  <- waiting
+...
+```
+
+`.002` does not start until `.001` is fully downloaded and assembled.
+
+Parallel downloading can improve speed when a single Telegram connection is the bottleneck. It cannot guarantee a specific MB/s because Telegram DC throttling and the server's network route can still be the limit.
+
+## Disk/RAM behavior
+
+RAM stays low because each worker writes chunks directly to its own segment file.
+
+During final assembly the segment files plus the assembled temporary file briefly coexist, so allow roughly **2x the size of the currently active part** as temporary free disk. With 2 GB archive parts, several extra GB free is enough.
 
 ## Ubuntu prerequisites
 
@@ -24,18 +50,40 @@ apt-get update
 apt-get install -y python3 python3-venv p7zip-full screen
 ```
 
-## First setup
+## `.env`
+
+Keep your real `.env` out of GitHub. Example:
+
+```env
+BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_API_ID=YOUR_API_ID
+TELEGRAM_API_HASH=YOUR_API_HASH
+ADMIN_IDS=YOUR_TELEGRAM_USER_ID
+
+UPLOAD_DIR=./uploads
+EXTRACT_DIR=./extracted
+STATE_DB=./queue.db
+SESSION_DIR=./session
+
+PARALLEL_STREAMS=4
+PROGRESS_INTERVAL=3
+```
+
+`PARALLEL_STREAMS=4` is recommended first. If Telegram starts throwing network/flood errors, use `2`. Going above 4 does not automatically mean faster downloads.
+
+## Start
+
+Foreground:
 
 ```bash
 cd /root/db2
-cp .env.example .env
-nano .env
 ./start.sh
 ```
 
-For background screen:
+Background with screen:
 
 ```bash
+cd /root/db2
 ./run_screen.sh
 ```
 
@@ -51,7 +99,7 @@ Stop:
 ./stop.sh
 ```
 
-## After GitHub updates
+## After GitHub update
 
 ```bash
 cd /root/db2
@@ -60,52 +108,85 @@ git pull
 ./run_screen.sh
 ```
 
-`start.sh` automatically installs any changed Python requirements.
+`start.sh` installs/updates the requirements automatically.
 
 ## Commands
 
-- `/start` or `/help`
-- `/ping`
-- `/whoami`
-- `/version`
-- `/upload_on`
-- `/upload_off`
-- `/upload_status`
-- `/queue`
-- `/retryfailed`
-- `/cancelcurrent CONFIRM`
-- `/files`
-- `/parts`
-- `/disk`
-- `/test7z`
-- `/info7z`
-- `/extract7z CONFIRM`
-
-## Recommended upload sequence
-
-1. `/upload_on`
-2. Forward all `.7z.001 ... .057` parts (any order)
-3. `/upload_off`
-4. Wait until `/queue` shows no queued/downloading jobs
-5. `/parts`
-6. `/test7z`
-7. `/extract7z CONFIRM`
-
-## Credentials
-
-`TELEGRAM_API_ID` and `TELEGRAM_API_HASH` come from `my.telegram.org/apps`, not BotFather. `BOT_TOKEN` comes from BotFather.
-
-Never commit `.env` to GitHub.
-
-## Important lifecycle fix
-
-This build intentionally starts PyroFork with `app.run(bot_main())`, matching the older working manager bot. Do **not** change it to `asyncio.run(...)`; doing that can put Pyrogram dispatcher tasks on a different event loop and cause the exact symptom where startup/outgoing messages work but incoming commands do not.
-
-After updating, verify the running code with:
-
 ```text
-/version
+/start
 /ping
+/version
+/whoami
+
+/upload_on
+/upload_off
+/upload_status
+
+/queue
+/retryfailed
+/cancelcurrent CONFIRM
+/files
+/parts
+/disk
+
+/test7z
+/info7z
+/extract7z CONFIRM
 ```
 
-The build should report `pyro-loopfix-2026-10-16-1`.
+## Recommended workflow
+
+```text
+/upload_on
+```
+
+Forward all archive parts. Order does not matter.
+
+Then:
+
+```text
+/upload_off
+/queue
+```
+
+When queued/downloading reaches zero:
+
+```text
+/parts
+/test7z
+/extract7z CONFIRM
+```
+
+## Resume behavior
+
+For a file such as `hitek.7z.001`, partial data is stored as hidden working-style files such as:
+
+```text
+hitek.7z.001.downloading.seg00
+hitek.7z.001.downloading.seg01
+hitek.7z.001.downloading.seg02
+hitek.7z.001.downloading.seg03
+```
+
+Do **not** manually delete these while you want resume support.
+
+If the bot is restarted, its SQLite queue changes an interrupted `downloading` job back to `queued`. When that job starts again, every segment resumes from its last complete 1 MiB chunk. At worst, less than 1 MiB per interrupted segment is downloaded again.
+
+If a job is marked failed, use:
+
+```text
+/retryfailed
+```
+
+The partial segments are intentionally preserved.
+
+## Dependency note
+
+This build uses:
+
+```text
+pyrofork==2.3.69
+TgCrypto-pyrofork==1.2.8
+```
+
+The PyroFork client is configured with `max_concurrent_transmissions` equal to `PARALLEL_STREAMS`, which is required for the parallel `get_file()` range workers.

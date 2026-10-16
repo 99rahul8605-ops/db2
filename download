@@ -6,7 +6,7 @@ extracted/
 queue.db
 queue.db-shm
 queue.db-wal
-*.session
-*.session-journal
+.bot.pid
+.bot.lock
 __pycache__/
 *.pyc

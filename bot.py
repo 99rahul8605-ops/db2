@@ -11,9 +11,10 @@ from functools import wraps
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, enums
 from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import Message
+from pyrogram.file_id import FileId
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -23,7 +24,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("hitek-upload-bot")
-BUILD = "pyro-loopfix-2026-10-16-1"
+BUILD = "pyro-parallel4-resume-2026-10-16-3"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
@@ -35,6 +36,9 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(ROOT / "uploads"))).resolve()
 EXTRACT_DIR = Path(os.getenv("EXTRACT_DIR", str(ROOT / "extracted"))).resolve()
 STATE_DB = Path(os.getenv("STATE_DB", str(ROOT / "queue.db"))).resolve()
 SESSION_DIR = Path(os.getenv("SESSION_DIR", str(ROOT / "session"))).resolve()
+PARALLEL_STREAMS = max(1, min(8, int(os.getenv("PARALLEL_STREAMS", "4") or 4)))
+PROGRESS_INTERVAL = max(2.0, float(os.getenv("PROGRESS_INTERVAL", "3") or 3))
+TG_CHUNK_SIZE = 1024 * 1024  # Pyrogram get_file() range unit is 1 MiB
 PID_FILE = ROOT / ".bot.pid"
 LOCK_FILE = ROOT / ".bot.lock"
 _INSTANCE_LOCK_FH = None
@@ -88,7 +92,12 @@ app = Client(
     workdir=str(SESSION_DIR),
     workers=8,
     sleep_threshold=20,
+    max_concurrent_transmissions=PARALLEL_STREAMS,
 )
+
+# File names and command output can contain Markdown/HTML-like characters.
+# Disable parsing globally so progress edits never trigger parser warnings.
+app.set_parse_mode(enums.ParseMode.DISABLED)
 
 # Safety: uploads are OFF after every process restart.
 upload_mode = False
@@ -274,7 +283,7 @@ def waiting_ahead(job_id):
 
 def files_list():
     return sorted(
-        (p for p in UPLOAD_DIR.iterdir() if p.is_file() and not p.name.endswith(".downloading")),
+        (p for p in UPLOAD_DIR.iterdir() if p.is_file() and ".downloading" not in p.name),
         key=lambda p: p.name.lower(),
     )
 
@@ -365,26 +374,26 @@ async def start_handler(client: Client, message: Message):
         "/ping — bot test\n"
         "/whoami — show IDs\n"
         "/version — show running build\n\n"
-        "Files can be forwarded in any order. Downloads run ONE file at a time."
+        "Files can be forwarded in any order. Queue runs ONE file at a time; that file uses parallel Telegram ranges."
     )
 
 
 @app.on_message(filters.command("ping"))
 @admin_only
 async def ping_handler(client: Client, message: Message):
-    await message.reply_text(f"✅ Pong — Pyrogram receiver is working.\nBuild: `{BUILD}`")
+    await message.reply_text(f"✅ Pong — Pyrogram receiver is working.\nBuild: {BUILD}\nParallel streams: {PARALLEL_STREAMS}")
 
 
 @app.on_message(filters.command("version"))
 async def version_handler(client: Client, message: Message):
-    await message.reply_text(f"Build: `{BUILD}`\nPID: `{os.getpid()}`")
+    await message.reply_text(f"Build: {BUILD}\nPID: {os.getpid()}\nParallel streams: {PARALLEL_STREAMS}")
 
 
 @app.on_message(filters.command("whoami"))
 async def whoami_handler(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else None
     await message.reply_text(
-        f"User ID: `{uid}`\nChat ID: `{message.chat.id}`\nAdmin: `{uid in ADMIN_IDS}`"
+        f"User ID: {uid}\nChat ID: {message.chat.id}\nAdmin: {uid in ADMIN_IDS}"
     )
 
 
@@ -407,7 +416,7 @@ async def upload_off_handler(client: Client, message: Message):
     c = queue_counts()
     await message.reply_text(
         "🔴 Upload mode OFF. New files will be ignored.\n"
-        f"Current: `{current_name or '-'}`\n"
+        f"Current: {current_name or '-'}\n"
         f"Queued: {c.get('queued', 0)}"
     )
 
@@ -418,7 +427,7 @@ async def upload_status_handler(client: Client, message: Message):
     c = queue_counts()
     await message.reply_text(
         f"Upload mode: {'🟢 ON' if upload_mode else '🔴 OFF'}\n"
-        f"Current: `{current_name or '-'}`\n"
+        f"Current: {current_name or '-'}\n"
         f"Queued: {c.get('queued', 0)}\n"
         f"Done: {c.get('done', 0)} • Failed: {c.get('failed', 0)}"
     )
@@ -429,11 +438,11 @@ async def upload_status_handler(client: Client, message: Message):
 async def queue_handler(client: Client, message: Message):
     c = queue_counts()
     text = (
-        f"Current: `{current_name or '-'}`\n"
+        f"Current: {current_name or '-'}\n"
         f"Queued: {c.get('queued', 0)}\n"
         f"Downloading: {c.get('downloading', 0)}\n"
         f"Done: {c.get('done', 0)}\n"
-        f"Failed: {c.get('failed', 0)}"
+        f"Failed: {c.get('failed', 0)}\nParallel streams/file: {PARALLEL_STREAMS}"
     )
     await message.reply_text(text)
 
@@ -521,11 +530,11 @@ async def test7z_handler(client: Client, message: Message):
         return await message.reply_text("⚠️ Archive operation already running.")
     base, items = choose_group(True)
     first = items[0][1]
-    status = await message.reply_text(f"🧪 Testing `{first.name}` ...")
+    status = await message.reply_text(f"🧪 Testing {first.name} ...")
     async with operation_lock:
         code, out = await run_cmd(["7z", "t", str(first)])
     tail = out[-3500:]
-    await edit_safe(status, f"{'✅' if code == 0 else '❌'} 7z test exit={code}\n```\n{tail}\n```")
+    await edit_safe(status, f"{'✅' if code == 0 else '❌'} 7z test exit={code}\n{tail}")
 
 
 @app.on_message(filters.command("info7z"))
@@ -534,7 +543,7 @@ async def info7z_handler(client: Client, message: Message):
     base, items = choose_group(True)
     first = items[0][1]
     code, out = await run_cmd(["7z", "l", "-slt", str(first)])
-    await message.reply_text(f"exit={code}\n```\n{out[-3500:]}\n```")
+    await message.reply_text(f"exit={code}\n{out[-3500:]}")
 
 
 @app.on_message(filters.command("extract7z"))
@@ -546,7 +555,7 @@ async def extract7z_handler(client: Client, message: Message):
         return await message.reply_text("⚠️ Archive operation already running.")
     _, items = choose_group(True)
     first = items[0][1]
-    status = await message.reply_text(f"📦 Extracting `{first.name}` ...")
+    status = await message.reply_text(f"📦 Extracting {first.name} ...")
     async with operation_lock:
         proc = await asyncio.create_subprocess_exec(
             "7z", "x", str(first), f"-o{EXTRACT_DIR}", "-y", "-bb1", "-bsp1",
@@ -569,7 +578,7 @@ async def extract7z_handler(client: Client, message: Message):
                 free = shutil.disk_usage(EXTRACT_DIR).free
                 await edit_safe(
                     status,
-                    f"📦 Extracting `{first.name}`\n"
+                    f"📦 Extracting {first.name}\n"
                     f"Progress: {pct}{'%' if str(pct).isdigit() else ''}\n"
                     f"Free disk: {human_size(free)}",
                 )
@@ -581,7 +590,7 @@ async def extract7z_handler(client: Client, message: Message):
         f"Free disk: {human_size(shutil.disk_usage(EXTRACT_DIR).free)}",
     )
     if code != 0:
-        await message.reply_text(f"```\n{tail[-3500:]}\n```")
+        await message.reply_text(f"{tail[-3500:]}")
 
 
 # Document handler comes AFTER command handlers and is private/admin only.
@@ -595,21 +604,232 @@ async def receive_document(client: Client, message: Message):
 
     if not upload_mode:
         return await message.reply_text(
-            f"⛔ Upload mode OFF. `{name}` was NOT queued.\nUse /upload_on first."
+            f"⛔ Upload mode OFF. {name} was NOT queued.\nUse /upload_on first."
         )
 
     job_id, inserted = add_job(message.chat.id, message.id, name, size, doc.file_id)
     if not inserted:
         with db_conn() as con:
             row = con.execute("SELECT status FROM queue WHERE id=?", (job_id,)).fetchone()
-        return await message.reply_text(f"ℹ️ Already known: `{name}` • status={row['status']}")
+        return await message.reply_text(f"ℹ️ Already known: {name} • status={row['status']}")
 
     position = waiting_ahead(job_id) + (1 if current_job_id else 0) + 1
     await message.reply_text(
-        f"📥 Queued `{name}`\n"
+        f"📥 Queued {name}\n"
         f"Size: {human_size(size)}\n"
         f"Queue position: {position}"
     )
+
+
+def _segment_plan(total_size: int, streams: int):
+    """Return contiguous 1-MiB aligned ranges for parallel Telegram downloads."""
+    if total_size <= 0:
+        return []
+    total_chunks = (total_size + TG_CHUNK_SIZE - 1) // TG_CHUNK_SIZE
+    workers = max(1, min(int(streams), int(total_chunks)))
+    base, extra = divmod(total_chunks, workers)
+    plan = []
+    start_chunk = 0
+    for idx in range(workers):
+        chunk_count = base + (1 if idx < extra else 0)
+        end_chunk = start_chunk + chunk_count
+        start_byte = start_chunk * TG_CHUNK_SIZE
+        end_byte = min(total_size, end_chunk * TG_CHUNK_SIZE)
+        plan.append({
+            "index": idx,
+            "start_chunk": start_chunk,
+            "end_chunk": end_chunk,
+            "size": end_byte - start_byte,
+        })
+        start_chunk = end_chunk
+    return plan
+
+
+def _segment_path(temp: Path, index: int) -> Path:
+    return Path(f"{temp}.seg{index:02d}")
+
+
+def _cleanup_segments(temp: Path):
+    for p in temp.parent.glob(temp.name + ".seg*"):
+        with suppress(FileNotFoundError):
+            p.unlink()
+
+
+def _prepare_resume_segment(path: Path, expected_size: int):
+    """Keep only complete 1-MiB chunks so resuming never duplicates bytes."""
+    if not path.exists():
+        return 0
+    size = path.stat().st_size
+    if size > expected_size:
+        with path.open("r+b") as fh:
+            fh.truncate(expected_size)
+        size = expected_size
+    if size == expected_size:
+        return size
+    aligned = (size // TG_CHUNK_SIZE) * TG_CHUNK_SIZE
+    if aligned != size:
+        with path.open("r+b") as fh:
+            fh.truncate(aligned)
+    return aligned
+
+
+def _merge_segments_sync(temp: Path, segment_paths, expected_size: int):
+    """Assemble segment files without loading the whole Telegram file into RAM."""
+    merge_tmp = Path(str(temp) + ".assembling")
+    with suppress(FileNotFoundError):
+        merge_tmp.unlink()
+    with merge_tmp.open("wb", buffering=8 * 1024 * 1024) as out:
+        for seg in segment_paths:
+            with seg.open("rb", buffering=8 * 1024 * 1024) as src:
+                shutil.copyfileobj(src, out, length=8 * 1024 * 1024)
+        out.flush()
+        os.fsync(out.fileno())
+    got = merge_tmp.stat().st_size
+    if expected_size and got != expected_size:
+        raise RuntimeError(f"Assembled size mismatch: got {got}, expected {expected_size}")
+    os.replace(merge_tmp, temp)
+
+
+async def parallel_download_file(media_file_id: str, expected: int, temp: Path, status: Message, job):
+    """
+    Download ONE Telegram file using several independent 1-MiB-aligned ranges.
+    The queue still processes only one file at a time. Each range is persisted
+    in its own segment file, so a restart resumes from completed MiB chunks.
+    """
+    if not media_file_id:
+        raise RuntimeError("Telegram file_id is missing; cannot start ranged download")
+    if expected <= 0:
+        raise RuntimeError("Telegram file size is unknown; cannot split ranged download safely")
+
+    decoded = FileId.decode(media_file_id)
+    plan = _segment_plan(expected, PARALLEL_STREAMS)
+    if not plan:
+        raise RuntimeError("Could not build parallel download plan")
+
+    segment_done = {}
+    segment_paths = []
+    for seg in plan:
+        path = _segment_path(temp, seg["index"])
+        have = _prepare_resume_segment(path, seg["size"])
+        segment_done[seg["index"]] = have
+        segment_paths.append(path)
+
+    resumed_bytes = sum(segment_done.values())
+    transfer_started = time.monotonic()
+    state = {
+        "last_t": transfer_started,
+        "last_bytes": resumed_bytes,
+        "smoothed": 0.0,
+    }
+
+    async def range_worker(seg):
+        idx = seg["index"]
+        path = _segment_path(temp, idx)
+        have = segment_done[idx]
+        if have >= seg["size"]:
+            return
+
+        # Resume only at complete MiB boundaries. For the last segment the final
+        # Telegram chunk may be smaller than 1 MiB, but if it exists completely
+        # _prepare_resume_segment() already returned seg["size"].
+        completed_chunks = have // TG_CHUNK_SIZE
+        offset_chunks = seg["start_chunk"] + completed_chunks
+        remaining_chunks = seg["end_chunk"] - offset_chunks
+        if remaining_chunks <= 0:
+            return
+
+        with path.open("ab", buffering=2 * TG_CHUNK_SIZE) as fh:
+            async for chunk in app.get_file(
+                decoded,
+                file_size=expected,
+                limit=remaining_chunks,
+                offset=offset_chunks,
+            ):
+                if cancel_current:
+                    raise asyncio.CancelledError("cancel requested")
+                remaining_bytes = seg["size"] - segment_done[idx]
+                if remaining_bytes <= 0:
+                    break
+                if len(chunk) > remaining_bytes:
+                    chunk = chunk[:remaining_bytes]
+                fh.write(chunk)
+                segment_done[idx] += len(chunk)
+                if segment_done[idx] >= seg["size"]:
+                    break
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        got = path.stat().st_size
+        if got != seg["size"]:
+            raise RuntimeError(
+                f"Stream {idx + 1}/{len(plan)} incomplete: got {got}, expected {seg['size']}"
+            )
+
+    tasks = [
+        asyncio.create_task(range_worker(seg), name=f"tg-range-{seg['index']}")
+        for seg in plan
+    ]
+
+    async def progress_reporter():
+        while True:
+            if all(t.done() for t in tasks):
+                break
+            await asyncio.sleep(PROGRESS_INTERVAL)
+            now = time.monotonic()
+            done = min(expected, sum(segment_done.values()))
+            dt = max(now - state["last_t"], 0.001)
+            delta = max(0, done - state["last_bytes"])
+            inst = delta / dt
+            if inst > 0:
+                if state["smoothed"] <= 0:
+                    state["smoothed"] = inst
+                else:
+                    state["smoothed"] = state["smoothed"] * 0.65 + inst * 0.35
+            speed = state["smoothed"]
+            eta = ((expected - done) / speed) if speed > 0 else None
+            pct = done * 100 / expected
+            counts = queue_counts()
+            resumed_note = f" • resumed {human_size(resumed_bytes)}" if resumed_bytes else ""
+            await edit_safe(
+                status,
+                f"⚡ Parallel {len(plan)}x: {job['file_name']}\n"
+                f"[{progress_bar(done, expected)}] {pct:.1f}%\n"
+                f"{human_size(done)} / {human_size(expected)}{resumed_note}\n"
+                f"Speed: {human_size(speed)}/s • ETA: {fmt_eta(eta)}\n"
+                f"Waiting: {counts.get('queued', 0)}",
+            )
+            state["last_t"] = now
+            state["last_bytes"] = done
+
+    reporter = asyncio.create_task(progress_reporter(), name="tg-progress-reporter")
+    try:
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+    finally:
+        reporter.cancel()
+        with suppress(asyncio.CancelledError):
+            await reporter
+
+    if cancel_current:
+        raise asyncio.CancelledError("cancel requested")
+
+    total_segments = sum(p.stat().st_size for p in segment_paths)
+    if total_segments != expected:
+        raise RuntimeError(f"Segment total mismatch: got {total_segments}, expected {expected}")
+
+    await edit_safe(
+        status,
+        f"🧩 Download complete for {job['file_name']}\n"
+        f"Assembling {len(segment_paths)} segments on disk...",
+    )
+    await asyncio.to_thread(_merge_segments_sync, temp, segment_paths, expected)
+    return segment_paths, resumed_bytes
 
 
 async def download_worker():
@@ -630,118 +850,135 @@ async def download_worker():
         status = None
 
         try:
-            msg = None
             expected = int(job["file_size"] or 0)
-            media_source = job.get("file_id")
-            if not media_source:
-                # Backward-compatible fallback for jobs queued by older versions.
+            media_file_id = job.get("file_id")
+
+            # Refresh the file_id/file_reference from the original message when
+            # possible. This prevents FILE_REFERENCE_EXPIRED after long queues or
+            # bot restarts. If the message is gone, the persisted file_id remains
+            # a fallback.
+            with suppress(Exception):
                 msg = await app.get_messages(job["chat_id"], job["message_id"])
-                if not msg or not msg.document:
-                    raise RuntimeError("Original Telegram document message is unavailable")
-                media_source = msg
-                expected = int(expected or msg.document.file_size or 0)
+                if msg and msg.document:
+                    media_file_id = msg.document.file_id
+                    expected = int(msg.document.file_size or expected or 0)
+                    with db_conn() as con:
+                        con.execute(
+                            "UPDATE queue SET file_id=?, file_size=?, updated_at=? WHERE id=?",
+                            (media_file_id, expected, time.time(), job["id"]),
+                        )
+
+            if not media_file_id:
+                raise RuntimeError("Telegram file_id is unavailable")
+            if not expected:
+                raise RuntimeError("Telegram file size is unavailable")
 
             # If already complete, don't download it again.
             if final.exists() and (not expected or final.stat().st_size == expected):
                 set_job_status(job["id"], "done")
+                _cleanup_segments(temp)
+                with suppress(FileNotFoundError):
+                    temp.unlink()
+                with suppress(FileNotFoundError):
+                    Path(str(temp) + ".assembling").unlink()
                 with suppress(Exception):
                     await app.send_message(
                         job["chat_id"],
-                        f"✅ Already exists, skipped: `{final.name}` ({human_size(final.stat().st_size)})",
+                        f"✅ Already exists, skipped: {final.name} ({human_size(final.stat().st_size)})",
                     )
                 continue
-
-            with suppress(FileNotFoundError):
-                temp.unlink()
 
             counts = queue_counts()
             status = await app.send_message(
                 job["chat_id"],
-                f"⬇️ Starting `{job['file_name']}`\n"
+                f"⚡ Starting {job['file_name']}\n"
                 f"Size: {human_size(expected)}\n"
-                f"Waiting: {counts.get('queued', 0)}",
+                f"Parallel streams: {PARALLEL_STREAMS}\n"
+                f"Only this ONE queue file is active. Waiting: {counts.get('queued', 0)}",
             )
 
-            state = {
-                "last_edit": 0.0,
-                "last_bytes": 0,
-                "last_t": current_started,
-                "smoothed": 0.0,
-            }
+            # A stale assembled temp can be recreated from persisted range segments.
+            with suppress(FileNotFoundError):
+                temp.unlink()
+            with suppress(FileNotFoundError):
+                Path(str(temp) + ".assembling").unlink()
+            # Old single-stream Pyrogram versions could leave this behind.
+            with suppress(FileNotFoundError):
+                Path(str(temp) + ".temp").unlink()
 
-            async def progress(current, total):
-                if cancel_current:
-                    # Pyrogram's stop_transmission cancels this active download.
-                    client = app
-                    client.stop_transmission()
-                    return
-
-                now = time.monotonic()
-                if current < total and now - state["last_edit"] < 3.0:
-                    return
-
-                dt = max(now - state["last_t"], 0.001)
-                inst = max(0, current - state["last_bytes"]) / dt
-                if state["smoothed"] <= 0:
-                    state["smoothed"] = inst
-                elif inst > 0:
-                    state["smoothed"] = state["smoothed"] * 0.70 + inst * 0.30
-                speed = state["smoothed"] or (current / max(now - current_started, 0.001))
-                eta = ((total - current) / speed) if total and speed > 0 else None
-                pct = (current * 100 / total) if total else 0
-                counts2 = queue_counts()
-                text = (
-                    f"⬇️ Downloading `{job['file_name']}`\n"
-                    f"[{progress_bar(current, total)}] {pct:.1f}%\n"
-                    f"{human_size(current)} / {human_size(total)}\n"
-                    f"Speed: {human_size(speed)}/s • ETA: {fmt_eta(eta)}\n"
-                    f"Waiting: {counts2.get('queued', 0)}"
-                )
-                await edit_safe(status, text)
-                state["last_edit"] = now
-                state["last_bytes"] = current
-                state["last_t"] = now
-
-            saved = await app.download_media(
-                media_source,
-                file_name=str(temp),
-                progress=progress,
+            segment_paths, resumed_bytes = await parallel_download_file(
+                media_file_id, expected, temp, status, job
             )
 
             if cancel_current:
                 raise asyncio.CancelledError("cancel requested")
-            if not saved or not temp.exists():
-                raise RuntimeError("Download stopped before completion")
+            if not temp.exists():
+                raise RuntimeError("Assembled download file is missing")
             if expected and temp.stat().st_size != expected:
                 raise RuntimeError(
                     f"Size mismatch: got {temp.stat().st_size}, expected {expected}"
                 )
 
             os.replace(temp, final)
+            # Only remove resumable segments after the final rename succeeds.
+            for seg in segment_paths:
+                with suppress(FileNotFoundError):
+                    seg.unlink()
+
             elapsed = max(time.monotonic() - current_started, 0.001)
-            avg = final.stat().st_size / elapsed
+            transferred_this_run = max(0, final.stat().st_size - resumed_bytes)
+            avg = transferred_this_run / elapsed
             set_job_status(job["id"], "done")
             counts3 = queue_counts()
             await edit_safe(
                 status,
-                f"✅ Downloaded `{final.name}`\n"
+                f"✅ Downloaded {final.name}\n"
                 f"Size: {human_size(final.stat().st_size)}\n"
-                f"Average: {human_size(avg)}/s\n"
+                f"Parallel: {len(segment_paths)}x • This run avg: {human_size(avg)}/s\n"
+                f"Resumed: {human_size(resumed_bytes)}\n"
                 f"Waiting: {counts3.get('queued', 0)} • Done: {counts3.get('done', 0)}",
             )
 
         except asyncio.CancelledError:
-            set_job_status(job["id"], "queued", "cancelled and requeued")
-            with suppress(FileNotFoundError):
-                temp.unlink()
-            if status:
-                await edit_safe(status, f"⏸ Cancelled `{job['file_name']}` and requeued it.")
+            # KEEP segment files. The next attempt resumes at completed 1-MiB chunks.
+            user_cancel = bool(cancel_current)
+            set_job_status(
+                job["id"],
+                "queued",
+                "cancelled and requeued; partial ranges preserved"
+                if user_cancel else
+                "bot stopped; requeued with partial ranges preserved",
+            )
+            if status and user_cancel:
+                done = sum(
+                    p.stat().st_size
+                    for p in temp.parent.glob(temp.name + ".seg*")
+                    if p.is_file()
+                )
+                await edit_safe(
+                    status,
+                    f"⏸ Cancelled {job['file_name']} and requeued.\n"
+                    f"Saved partial data: {human_size(done)} — resume will continue from there.",
+                )
+            # A task cancellation caused by bot shutdown must not be swallowed,
+            # otherwise app.stop() can hang waiting for this infinite worker.
+            if not user_cancel:
+                raise
         except Exception as e:
             log.exception("Download failed for job %s", job["id"])
+            # KEEP segment files on failure so /retryfailed resumes instead of starting over.
             set_job_status(job["id"], "failed", f"{type(e).__name__}: {e}")
-            with suppress(FileNotFoundError):
-                temp.unlink()
-            text = f"❌ Download failed `{job['file_name']}`\n{type(e).__name__}: {e}"
+            done = sum(
+                p.stat().st_size
+                for p in temp.parent.glob(temp.name + ".seg*")
+                if p.is_file()
+            )
+            text = (
+                f"❌ Download failed {job['file_name']}\n"
+                f"{type(e).__name__}: {e}\n"
+                f"Partial preserved: {human_size(done)}\n"
+                f"Use /retryfailed to resume."
+            )
             if status:
                 await edit_safe(status, text)
             else:
@@ -762,14 +999,14 @@ async def bot_main():
     log.info("Started as @%s (id=%s) build=%s", me.username, me.id, BUILD)
     log.info("Pyrogram/PyroFork version active; .env=%s", ROOT / ".env")
     log.info("ADMIN_IDS=%s", sorted(ADMIN_IDS))
-    log.info("Upload mode starts OFF")
+    log.info("Upload mode starts OFF; parallel streams/file=%s", PARALLEL_STREAMS)
 
     worker_task = asyncio.create_task(download_worker(), name="download-worker")
     for uid in ADMIN_IDS:
         with suppress(Exception):
             await app.send_message(
                 uid,
-                f"✅ @{me.username} started with Pyrogram. Upload mode is OFF.\nBuild: `{BUILD}`\nSend /ping.",
+                f"✅ @{me.username} started with Pyrogram. Upload mode is OFF.\nBuild: {BUILD}\nParallel streams/file: {PARALLEL_STREAMS}\nSend /ping.",
             )
     try:
         await idle()

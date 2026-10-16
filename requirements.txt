@@ -1,0 +1,2 @@
+pyrofork==2.3.69
+python-dotenv>=1.0,<2

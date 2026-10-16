@@ -1,0 +1,23 @@
+[Unit]
+Description=Hitek Telegram Upload/Extract Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hitek-bot
+EnvironmentFile=/opt/hitek-bot/.env
+ExecStart=/opt/hitek-bot/venv/bin/python /opt/hitek-bot/bot.py
+Restart=always
+RestartSec=5
+Nice=5
+
+# Simple hardening while keeping access to /opt/hitek-bot.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/hitek-bot
+
+[Install]
+WantedBy=multi-user.target

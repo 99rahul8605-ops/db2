@@ -24,7 +24,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("hitek-upload-bot")
-BUILD = "pyro-parallel4-resume-2026-10-16-3"
+BUILD = "pyro-parallel4-retry-2026-10-16-4"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
@@ -38,6 +38,8 @@ STATE_DB = Path(os.getenv("STATE_DB", str(ROOT / "queue.db"))).resolve()
 SESSION_DIR = Path(os.getenv("SESSION_DIR", str(ROOT / "session"))).resolve()
 PARALLEL_STREAMS = max(1, min(8, int(os.getenv("PARALLEL_STREAMS", "4") or 4)))
 PROGRESS_INTERVAL = max(2.0, float(os.getenv("PROGRESS_INTERVAL", "3") or 3))
+STREAM_RETRIES = max(1, min(50, int(os.getenv("STREAM_RETRIES", "12") or 12)))
+STREAM_RETRY_DELAY = max(0.5, float(os.getenv("STREAM_RETRY_DELAY", "2") or 2))
 TG_CHUNK_SIZE = 1024 * 1024  # Pyrogram get_file() range unit is 1 MiB
 PID_FILE = ROOT / ".bot.pid"
 LOCK_FILE = ROOT / ".bot.lock"
@@ -725,44 +727,98 @@ async def parallel_download_file(media_file_id: str, expected: int, temp: Path, 
     async def range_worker(seg):
         idx = seg["index"]
         path = _segment_path(temp, idx)
-        have = segment_done[idx]
-        if have >= seg["size"]:
+        if segment_done[idx] >= seg["size"]:
             return
 
-        # Resume only at complete MiB boundaries. For the last segment the final
-        # Telegram chunk may be smaller than 1 MiB, but if it exists completely
-        # _prepare_resume_segment() already returned seg["size"].
-        completed_chunks = have // TG_CHUNK_SIZE
-        offset_chunks = seg["start_chunk"] + completed_chunks
-        remaining_chunks = seg["end_chunk"] - offset_chunks
-        if remaining_chunks <= 0:
-            return
+        # PyroFork's get_file() can occasionally end a ranged generator early
+        # after a media-DC timeout/reconnect. Treat that as resumable, not fatal.
+        # Every retry starts at the next complete 1 MiB chunk already persisted.
+        attempts = 0
+        last_error = None
+        while segment_done[idx] < seg["size"]:
+            if cancel_current:
+                raise asyncio.CancelledError("cancel requested")
 
-        with path.open("ab", buffering=2 * TG_CHUNK_SIZE) as fh:
-            async for chunk in app.get_file(
-                decoded,
-                file_size=expected,
-                limit=remaining_chunks,
-                offset=offset_chunks,
-            ):
-                if cancel_current:
-                    raise asyncio.CancelledError("cancel requested")
-                remaining_bytes = seg["size"] - segment_done[idx]
-                if remaining_bytes <= 0:
-                    break
-                if len(chunk) > remaining_bytes:
-                    chunk = chunk[:remaining_bytes]
-                fh.write(chunk)
-                segment_done[idx] += len(chunk)
-                if segment_done[idx] >= seg["size"]:
-                    break
-            fh.flush()
-            os.fsync(fh.fileno())
+            # Never trust a partial Telegram chunk across a reconnect. Keep the
+            # segment at a complete 1 MiB boundary (unless it is fully complete).
+            current_size = path.stat().st_size if path.exists() else 0
+            if current_size != segment_done[idx]:
+                segment_done[idx] = current_size
+            if segment_done[idx] < seg["size"]:
+                aligned = (segment_done[idx] // TG_CHUNK_SIZE) * TG_CHUNK_SIZE
+                if aligned != segment_done[idx]:
+                    with path.open("r+b") as trim:
+                        trim.truncate(aligned)
+                    segment_done[idx] = aligned
 
-        got = path.stat().st_size
+            completed_chunks = segment_done[idx] // TG_CHUNK_SIZE
+            offset_chunks = seg["start_chunk"] + completed_chunks
+            remaining_chunks = seg["end_chunk"] - offset_chunks
+            if remaining_chunks <= 0:
+                break
+
+            before = segment_done[idx]
+            try:
+                with path.open("ab", buffering=2 * TG_CHUNK_SIZE) as fh:
+                    async for chunk in app.get_file(
+                        decoded,
+                        file_size=expected,
+                        limit=remaining_chunks,
+                        offset=offset_chunks,
+                    ):
+                        if cancel_current:
+                            raise asyncio.CancelledError("cancel requested")
+                        remaining_bytes = seg["size"] - segment_done[idx]
+                        if remaining_bytes <= 0:
+                            break
+                        if len(chunk) > remaining_bytes:
+                            chunk = chunk[:remaining_bytes]
+                        fh.write(chunk)
+                        segment_done[idx] += len(chunk)
+                        if segment_done[idx] >= seg["size"]:
+                            break
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                last_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                log.warning(
+                    "Range %s/%s interrupted at %s/%s: %s: %s",
+                    idx + 1, len(plan), human_size(segment_done[idx]),
+                    human_size(seg["size"]), type(exc).__name__, exc,
+                )
+
+            # A normal generator termination can still be an early EOF after a
+            # timeout. If we made progress, reset the consecutive-failure budget.
+            made_progress = segment_done[idx] > before
+            if segment_done[idx] >= seg["size"]:
+                break
+            attempts = 0 if made_progress else attempts + 1
+            if attempts >= STREAM_RETRIES:
+                detail = (
+                    f"; last error={type(last_error).__name__}: {last_error}"
+                    if last_error else ""
+                )
+                raise RuntimeError(
+                    f"Stream {idx + 1}/{len(plan)} stalled after {STREAM_RETRIES} retries: "
+                    f"got {segment_done[idx]}, expected {seg['size']}{detail}"
+                )
+
+            wait = min(15.0, STREAM_RETRY_DELAY * (1.6 ** min(attempts, 5)))
+            log.info(
+                "Resuming range %s/%s from %s/%s in %.1fs",
+                idx + 1, len(plan), human_size(segment_done[idx]),
+                human_size(seg["size"]), wait,
+            )
+            await asyncio.sleep(wait)
+
+        got = path.stat().st_size if path.exists() else 0
         if got != seg["size"]:
             raise RuntimeError(
-                f"Stream {idx + 1}/{len(plan)} incomplete: got {got}, expected {seg['size']}"
+                f"Stream {idx + 1}/{len(plan)} incomplete after retries: "
+                f"got {got}, expected {seg['size']}"
             )
 
     tasks = [
@@ -893,7 +949,7 @@ async def download_worker():
                 job["chat_id"],
                 f"⚡ Starting {job['file_name']}\n"
                 f"Size: {human_size(expected)}\n"
-                f"Parallel streams: {PARALLEL_STREAMS}\n"
+                f"Parallel streams: {PARALLEL_STREAMS} • auto-retry: {STREAM_RETRIES}\n"
                 f"Only this ONE queue file is active. Waiting: {counts.get('queued', 0)}",
             )
 
@@ -999,7 +1055,7 @@ async def bot_main():
     log.info("Started as @%s (id=%s) build=%s", me.username, me.id, BUILD)
     log.info("Pyrogram/PyroFork version active; .env=%s", ROOT / ".env")
     log.info("ADMIN_IDS=%s", sorted(ADMIN_IDS))
-    log.info("Upload mode starts OFF; parallel streams/file=%s", PARALLEL_STREAMS)
+    log.info("Upload mode starts OFF; parallel streams/file=%s; stream retries=%s", PARALLEL_STREAMS, STREAM_RETRIES)
 
     worker_task = asyncio.create_task(download_worker(), name="download-worker")
     for uid in ADMIN_IDS:

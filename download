@@ -1,0 +1,11 @@
+.env
+*.session
+*.session-journal
+session/
+venv/
+queue.db
+queue.db-*
+uploads/
+extracted/
+__pycache__/
+*.pyc

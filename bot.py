@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
-load_dotenv()
+ENV_FILE = Path(__file__).resolve().with_name(".env")
+load_dotenv(ENV_FILE)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -374,12 +375,52 @@ async def download_worker():
             queue.task_done()
 
 
+
+
+@app.on_message(filters.all, group=-100)
+async def incoming_debug(client: Client, message: Message):
+    """Log every incoming update before command/document handlers run."""
+    try:
+        log.info(
+            "INCOMING chat=%s from=%s username=%s text=%r document=%s file=%s",
+            message.chat.id if message.chat else None,
+            message.from_user.id if message.from_user else None,
+            message.from_user.username if message.from_user else None,
+            message.text or message.caption,
+            bool(message.document),
+            message.document.file_name if message.document else None,
+        )
+    except Exception:
+        log.exception("Failed to log incoming update")
+
+
+@app.on_message(filters.command("whoami"), group=-10)
+async def whoami_cmd(client: Client, message: Message):
+    uid = message.from_user.id if message.from_user else None
+    cid = message.chat.id if message.chat else None
+    is_allowed = uid in ADMIN_IDS if uid is not None else False
+    await message.reply_text(
+        f"Your user ID: `{uid}`\n"
+        f"Chat ID: `{cid}`\n"
+        f"Admin allowed: `{'yes' if is_allowed else 'no'}`"
+    )
+
+
+@app.on_message(filters.command("ping"), group=-10)
+async def ping_cmd(client: Client, message: Message):
+    if await deny_if_needed(message):
+        return
+    await message.reply_text("✅ Pong. Bot handlers are working.")
+
 @app.on_message(filters.command(["start", "help"]))
 async def help_cmd(client: Client, message: Message):
     if await deny_if_needed(message):
         return
     await message.reply_text(
         "🗄 Hitek Upload/Extract Bot (Ubuntu)\n\n"
+        "DIAGNOSTICS\n"
+        "/ping - test bot response\n"
+        "/whoami - show your Telegram user/chat ID\n\n"
         "UPLOAD\n"
         "• Forward/send documents → queued automatically\n"
         "• Only ONE file downloads at a time (low RAM)\n• Live % / speed / ETA / overall progress\n"
@@ -687,12 +728,31 @@ async def main():
     await bootstrap_queue()
     worker_task = asyncio.create_task(download_worker())
     me = await app.get_me()
-    log.info("Started as @%s", me.username)
+    log.info("Started as @%s (id=%s)", me.username, me.id)
+    log.info("Loaded .env from %s", ENV_FILE)
+    log.info("Configured ADMIN_IDS=%s", sorted(ADMIN_IDS))
+
+    # Best-effort startup notification. This succeeds only after an admin has
+    # opened/started the bot at least once, which is useful as a health check.
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            await app.send_message(
+                admin_id,
+                f"✅ @{me.username} started successfully.\n"
+                "Send /ping to test handlers or /whoami to verify your ID.",
+            )
+        except Exception as exc:
+            log.warning("Startup message to admin %s failed: %s", admin_id, exc)
+
     try:
-        await asyncio.Event().wait()
+        await idle()
     finally:
         if worker_task:
             worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
         await app.stop()
 
 

@@ -1,73 +1,136 @@
-# Hitek Upload / Extract Bot for Ubuntu
+# Hitek Upload / Extract Bot (Ubuntu / Docker / RDP)
 
-Purpose: forward many large `.7z.001`, `.7z.002`, ... parts to a Telegram bot. The bot queues every document and downloads **one at a time**, so dozens of forwarded files do not download concurrently.
+A Telegram bot for receiving large split archives such as `hitek.7z.001 ... hitek.7z.057`, queuing every forwarded document, and downloading **one file at a time**. It reports live percentage, speed, ETA, queue state, archive validation, extraction progress, disk usage, and errors back to Telegram.
 
-## Why Pyrogram / MTProto?
-The normal hosted Bot API `getFile` endpoint is limited for downloads. This project uses Pyrogram/PyroFork with Telegram API ID + API hash + bot token, matching the approach in your older manager bot and avoiding the hosted Bot API download path.
+## Important security note
 
-## Install
+Never commit `.env` to GitHub. If a bot token or Telegram API hash has been pasted publicly, rotate it before deployment.
+
+## Install on Ubuntu/container
 
 ```bash
-unzip hitek_upload_bot.zip
+unzip hitek_upload_bot_fixed.zip
 cd hitek_upload_bot
 sudo bash install.sh
-sudo nano /opt/hitek-bot/.env
-sudo systemctl enable --now hitek-upload-bot
-sudo journalctl -u hitek-upload-bot -f
+nano /opt/hitek-bot/.env
 ```
 
-Fill `.env` with:
-- `BOT_TOKEN` from BotFather
-- `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` from my.telegram.org/apps
-- `ADMIN_IDS` = your Telegram numeric user ID
+Fill the real values:
 
-## Bot commands
+```env
+BOT_TOKEN=...
+TELEGRAM_API_ID=...
+TELEGRAM_API_HASH=...
+ADMIN_IDS=8484531901
+BASE_DIR=/opt/hitek-bot
+UPLOAD_DIR=/opt/hitek-bot/uploads
+EXTRACT_DIR=/opt/hitek-bot/extracted
+STATE_DB=/opt/hitek-bot/queue.db
+SESSION_DIR=/opt/hitek-bot/session
+```
 
-- Send/forward documents: automatically queued
-- `/queue` current + waiting + completed/failed counts
-- `/files` list saved files
-- `/parts` validate `.7z.001` sequence and show missing volumes
-- `/disk` disk + basic RAM info
-- `/du` uploads/extracted sizes
-- `/test7z` run `7z t` after all parts are present
-- `/info7z` show 7z metadata/listing
-- `/extract7z CONFIRM` extract to `/opt/hitek-bot/extracted`
-- `/retryfailed` retry failed Telegram downloads
-- `/clearqueue CONFIRM` remove waiting jobs only
-- `/deleteuploads CONFIRM` delete received parts
-- `/deleteextracted CONFIRM` clear extraction folder
+`TELEGRAM_API_ID` and `TELEGRAM_API_HASH` must be a matching pair from `my.telegram.org/apps`.
+
+### Start in a Docker/RDP/container without systemd
+
+```bash
+/opt/hitek-bot/start.sh
+```
+
+View the bot console:
+
+```bash
+screen -r hitekbot
+```
+
+Detach without stopping it: `Ctrl+A`, then `D`.
+
+Stop:
+
+```bash
+/opt/hitek-bot/stop.sh
+```
+
+If startup fails, run it in foreground to see the exact traceback:
+
+```bash
+cd /opt/hitek-bot
+venv/bin/python3 bot.py
+```
+
+### On a normal systemd Ubuntu VM
+
+```bash
+systemctl enable --now hitek-upload-bot
+journalctl -u hitek-upload-bot -f
+```
+
+## First diagnostics
+
+Open the bot in a **private Telegram chat**, press Start, then send:
+
+```text
+/whoami
+/ping
+/start
+```
+
+`/whoami` works even when your ID is not in `ADMIN_IDS`; it tells you the exact Telegram numeric user ID and whether it is allowed. Every incoming update is also logged in the console as `INCOMING ...`, making silent-handler issues easy to diagnose.
+
+At startup the bot also tries to send each configured admin a health message. Telegram only allows that after the user has opened/started the bot at least once.
+
+## Commands
+
+- `/start` or `/help` — command list
+- `/ping` — handler health check
+- `/whoami` — show user/chat ID and admin status
+- Send/forward documents — queue automatically
+- `/queue` — current + waiting + done/failed counts
+- `/files` — stored file summary
+- `/parts` — validate `.7z.001 ...` sequence and list missing parts
+- `/disk` — disk/RAM usage
+- `/du` — upload/extracted directory sizes
+- `/test7z` — `7z t` on a complete sequence
+- `/info7z` — archive metadata/listing
+- `/extract7z CONFIRM` — extract into `EXTRACT_DIR` with live progress
+- `/retryfailed` — retry failed Telegram downloads
+- `/clearqueue CONFIRM` — clear waiting jobs
+- `/deleteuploads CONFIRM` — delete received archive files
+- `/deleteextracted CONFIRM` — clear extraction directory
 
 ## Queue behavior
 
-Forwarding 57 files rapidly is OK. Each message is first stored as a small queue record. Only one file is downloaded at any time. Queue metadata is persisted in `/opt/hitek-bot/queue.db`, so after a service restart, waiting downloads are requeued.
+You can forward all archive parts rapidly. Telegram messages become tiny persistent queue records in `queue.db`; only **one document is downloaded at a time**. If the bot restarts, interrupted downloads are put back in the queue.
 
-## Security
+Download progress is edited roughly every three seconds with current bytes, percentage, transfer speed, ETA, overall job number, completed count, and waiting count.
 
-Only IDs in `ADMIN_IDS` can use the bot. There is deliberately no arbitrary `/shell` or `/cmd` endpoint. A leaked bot token should not become unrestricted remote shell access to the Ubuntu server.
+## GitHub update workflow
 
-Keep `.env` permissions restricted:
-
-```bash
-chmod 600 /opt/hitek-bot/.env
-```
-
-## Useful Ubuntu commands
+After pulling a new version:
 
 ```bash
-systemctl status hitek-upload-bot
-journalctl -u hitek-upload-bot -f
-systemctl restart hitek-upload-bot
-systemctl stop hitek-upload-bot
-
-df -h /
-du -sh /opt/hitek-bot/uploads /opt/hitek-bot/extracted
+cd /path/to/repo
+sudo bash install.sh
+/opt/hitek-bot/stop.sh
+/opt/hitek-bot/start.sh
 ```
 
-## Important
+The installer intentionally **does not overwrite** an existing `/opt/hitek-bot/.env`.
 
-Do not start `/extract7z CONFIRM` until `/parts` reports a complete contiguous sequence. For your current archive this should look like `.001` through `.057` with no missing numbers.
+## Troubleshooting
 
-## Live progress
-Downloads update one Telegram status message about every 3 seconds with current bytes, percentage, transfer speed, ETA, overall job number, completed count, and waiting count. Archive extraction uses 7-Zip progress output and updates about every 4 seconds with extraction percentage (when reported) and remaining disk space.
+If the bot says `API_ID_INVALID`, the `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` pair is wrong. Use a matching pair from `my.telegram.org/apps`.
 
-For large batches, send/forward all documents to the bot. They are queued and downloaded strictly one at a time.
+If the bot starts but seems silent, attach to the screen and send `/whoami`:
+
+```bash
+screen -r hitekbot
+```
+
+You should see an `INCOMING` log line for every received message. If there is no `INCOMING` line, verify you are messaging the exact username printed in `Started as @...`, then remove only the bot session and restart:
+
+```bash
+/opt/hitek-bot/stop.sh
+rm -f /opt/hitek-bot/session/hitek_upload_bot.session*
+/opt/hitek-bot/start.sh
+```

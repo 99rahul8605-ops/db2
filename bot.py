@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import fcntl
 import re
 import shutil
 import sqlite3
@@ -22,6 +23,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("hitek-upload-bot")
+BUILD = "pyro-loopfix-2026-10-16-1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
@@ -33,6 +35,9 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(ROOT / "uploads"))).resolve()
 EXTRACT_DIR = Path(os.getenv("EXTRACT_DIR", str(ROOT / "extracted"))).resolve()
 STATE_DB = Path(os.getenv("STATE_DB", str(ROOT / "queue.db"))).resolve()
 SESSION_DIR = Path(os.getenv("SESSION_DIR", str(ROOT / "session"))).resolve()
+PID_FILE = ROOT / ".bot.pid"
+LOCK_FILE = ROOT / ".bot.lock"
+_INSTANCE_LOCK_FH = None
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN missing in .env")
@@ -46,6 +51,34 @@ if not ADMIN_IDS:
 for p in (UPLOAD_DIR, EXTRACT_DIR, SESSION_DIR):
     p.mkdir(parents=True, exist_ok=True)
 STATE_DB.parent.mkdir(parents=True, exist_ok=True)
+
+
+def acquire_instance_lock():
+    global _INSTANCE_LOCK_FH
+    fh = open(LOCK_FILE, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise SystemExit(
+            "Another hitek bot instance is already running. Stop it first with ./stop.sh"
+        )
+    _INSTANCE_LOCK_FH = fh
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def release_instance_lock():
+    global _INSTANCE_LOCK_FH
+    with suppress(Exception):
+        if PID_FILE.exists() and PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            PID_FILE.unlink()
+    if _INSTANCE_LOCK_FH is not None:
+        with suppress(Exception):
+            fcntl.flock(_INSTANCE_LOCK_FH.fileno(), fcntl.LOCK_UN)
+        with suppress(Exception):
+            _INSTANCE_LOCK_FH.close()
+        _INSTANCE_LOCK_FH = None
+
 
 app = Client(
     "hitek_upload_bot",
@@ -85,6 +118,7 @@ def init_db():
                 message_id INTEGER NOT NULL,
                 file_name TEXT NOT NULL,
                 file_size INTEGER NOT NULL DEFAULT 0,
+                file_id TEXT,
                 status TEXT NOT NULL DEFAULT 'queued',
                 error TEXT,
                 created_at REAL NOT NULL,
@@ -94,6 +128,11 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_queue_status_id ON queue(status, id);
             """
         )
+        # Schema migration for queues created by older versions.
+        cols = {r[1] for r in con.execute("PRAGMA table_info(queue)").fetchall()}
+        if "file_id" not in cols:
+            con.execute("ALTER TABLE queue ADD COLUMN file_id TEXT")
+
         # Recover interrupted jobs after restart.
         con.execute(
             "UPDATE queue SET status='queued', error=NULL, updated_at=? WHERE status='downloading'",
@@ -178,23 +217,28 @@ def queue_counts():
     return counts
 
 
-def add_job(chat_id, message_id, file_name, file_size):
+def add_job(chat_id, message_id, file_name, file_size, file_id=None):
     now = time.time()
     with db_conn() as con:
         try:
             cur = con.execute(
                 """
-                INSERT INTO queue(chat_id,message_id,file_name,file_size,status,created_at,updated_at)
-                VALUES(?,?,?,?, 'queued', ?, ?)
+                INSERT INTO queue(chat_id,message_id,file_name,file_size,file_id,status,created_at,updated_at)
+                VALUES(?,?,?,?,?, 'queued', ?, ?)
                 """,
-                (chat_id, message_id, file_name, file_size, now, now),
+                (chat_id, message_id, file_name, file_size, file_id, now, now),
             )
             return cur.lastrowid, True
         except sqlite3.IntegrityError:
             row = con.execute(
-                "SELECT id,status FROM queue WHERE chat_id=? AND message_id=?",
+                "SELECT id,status,file_id FROM queue WHERE chat_id=? AND message_id=?",
                 (chat_id, message_id),
             ).fetchone()
+            if file_id and not row["file_id"]:
+                con.execute(
+                    "UPDATE queue SET file_id=?, updated_at=? WHERE id=?",
+                    (file_id, now, row["id"]),
+                )
             return row["id"], False
 
 
@@ -285,7 +329,7 @@ async def run_cmd(args, cwd=None):
     return proc.returncode, out.decode(errors="replace")
 
 
-@app.on_message(filters.all, group=-10)
+@app.on_message(filters.all, group=-100)
 async def incoming_logger(client: Client, message: Message):
     log.info(
         "INCOMING chat=%s from=%s msg=%s text=%r document=%s",
@@ -297,7 +341,7 @@ async def incoming_logger(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.command(["start", "help"]) & filters.private)
+@app.on_message(filters.command(["start", "help"]))
 @admin_only
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
@@ -319,18 +363,24 @@ async def start_handler(client: Client, message: Message):
         "System:\n"
         "/disk — disk + RAM\n"
         "/ping — bot test\n"
-        "/whoami — show IDs\n\n"
+        "/whoami — show IDs\n"
+        "/version — show running build\n\n"
         "Files can be forwarded in any order. Downloads run ONE file at a time."
     )
 
 
-@app.on_message(filters.command("ping") & filters.private)
+@app.on_message(filters.command("ping"))
 @admin_only
 async def ping_handler(client: Client, message: Message):
-    await message.reply_text("✅ Pong — Pyrogram receiver is working.")
+    await message.reply_text(f"✅ Pong — Pyrogram receiver is working.\nBuild: `{BUILD}`")
 
 
-@app.on_message(filters.command("whoami") & filters.private)
+@app.on_message(filters.command("version"))
+async def version_handler(client: Client, message: Message):
+    await message.reply_text(f"Build: `{BUILD}`\nPID: `{os.getpid()}`")
+
+
+@app.on_message(filters.command("whoami"))
 async def whoami_handler(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else None
     await message.reply_text(
@@ -338,7 +388,7 @@ async def whoami_handler(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.command("upload_on") & filters.private)
+@app.on_message(filters.command("upload_on"))
 @admin_only
 async def upload_on_handler(client: Client, message: Message):
     global upload_mode
@@ -349,7 +399,7 @@ async def upload_on_handler(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.command("upload_off") & filters.private)
+@app.on_message(filters.command("upload_off"))
 @admin_only
 async def upload_off_handler(client: Client, message: Message):
     global upload_mode
@@ -362,7 +412,7 @@ async def upload_off_handler(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.command("upload_status") & filters.private)
+@app.on_message(filters.command("upload_status"))
 @admin_only
 async def upload_status_handler(client: Client, message: Message):
     c = queue_counts()
@@ -374,7 +424,7 @@ async def upload_status_handler(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.command("queue") & filters.private)
+@app.on_message(filters.command("queue"))
 @admin_only
 async def queue_handler(client: Client, message: Message):
     c = queue_counts()
@@ -388,7 +438,7 @@ async def queue_handler(client: Client, message: Message):
     await message.reply_text(text)
 
 
-@app.on_message(filters.command("retryfailed") & filters.private)
+@app.on_message(filters.command("retryfailed"))
 @admin_only
 async def retry_failed_handler(client: Client, message: Message):
     with db_conn() as con:
@@ -399,7 +449,7 @@ async def retry_failed_handler(client: Client, message: Message):
     await message.reply_text(f"🔁 Requeued {cur.rowcount} failed job(s).")
 
 
-@app.on_message(filters.command("cancelcurrent") & filters.private)
+@app.on_message(filters.command("cancelcurrent"))
 @admin_only
 async def cancel_current_handler(client: Client, message: Message):
     global cancel_current
@@ -412,7 +462,7 @@ async def cancel_current_handler(client: Client, message: Message):
     await message.reply_text("⚠️ Cancellation requested. Current file will be requeued.")
 
 
-@app.on_message(filters.command("files") & filters.private)
+@app.on_message(filters.command("files"))
 @admin_only
 async def files_handler(client: Client, message: Message):
     fs = files_list()
@@ -427,7 +477,7 @@ async def files_handler(client: Client, message: Message):
     await message.reply_text("\n".join(lines))
 
 
-@app.on_message(filters.command("parts") & filters.private)
+@app.on_message(filters.command("parts"))
 @admin_only
 async def parts_handler(client: Client, message: Message):
     groups = detect_parts()
@@ -441,7 +491,7 @@ async def parts_handler(client: Client, message: Message):
     await message.reply_text("\n\n".join(lines))
 
 
-@app.on_message(filters.command("disk") & filters.private)
+@app.on_message(filters.command("disk"))
 @admin_only
 async def disk_handler(client: Client, message: Message):
     d = shutil.disk_usage(UPLOAD_DIR)
@@ -464,7 +514,7 @@ async def disk_handler(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.command("test7z") & filters.private)
+@app.on_message(filters.command("test7z"))
 @admin_only
 async def test7z_handler(client: Client, message: Message):
     if operation_lock.locked():
@@ -478,7 +528,7 @@ async def test7z_handler(client: Client, message: Message):
     await edit_safe(status, f"{'✅' if code == 0 else '❌'} 7z test exit={code}\n```\n{tail}\n```")
 
 
-@app.on_message(filters.command("info7z") & filters.private)
+@app.on_message(filters.command("info7z"))
 @admin_only
 async def info7z_handler(client: Client, message: Message):
     base, items = choose_group(True)
@@ -487,7 +537,7 @@ async def info7z_handler(client: Client, message: Message):
     await message.reply_text(f"exit={code}\n```\n{out[-3500:]}\n```")
 
 
-@app.on_message(filters.command("extract7z") & filters.private)
+@app.on_message(filters.command("extract7z"))
 @admin_only
 async def extract7z_handler(client: Client, message: Message):
     if len(message.command or []) < 2 or message.command[1] != "CONFIRM":
@@ -535,7 +585,7 @@ async def extract7z_handler(client: Client, message: Message):
 
 
 # Document handler comes AFTER command handlers and is private/admin only.
-@app.on_message(filters.document & filters.private)
+@app.on_message(filters.document, group=10)
 @admin_only
 async def receive_document(client: Client, message: Message):
     global upload_mode
@@ -548,7 +598,7 @@ async def receive_document(client: Client, message: Message):
             f"⛔ Upload mode OFF. `{name}` was NOT queued.\nUse /upload_on first."
         )
 
-    job_id, inserted = add_job(message.chat.id, message.id, name, size)
+    job_id, inserted = add_job(message.chat.id, message.id, name, size, doc.file_id)
     if not inserted:
         with db_conn() as con:
             row = con.execute("SELECT status FROM queue WHERE id=?", (job_id,)).fetchone()
@@ -580,11 +630,16 @@ async def download_worker():
         status = None
 
         try:
-            msg = await app.get_messages(job["chat_id"], job["message_id"])
-            if not msg or not msg.document:
-                raise RuntimeError("Original Telegram document message is unavailable")
-
-            expected = int(job["file_size"] or msg.document.file_size or 0)
+            msg = None
+            expected = int(job["file_size"] or 0)
+            media_source = job.get("file_id")
+            if not media_source:
+                # Backward-compatible fallback for jobs queued by older versions.
+                msg = await app.get_messages(job["chat_id"], job["message_id"])
+                if not msg or not msg.document:
+                    raise RuntimeError("Original Telegram document message is unavailable")
+                media_source = msg
+                expected = int(expected or msg.document.file_size or 0)
 
             # If already complete, don't download it again.
             if final.exists() and (not expected or final.stat().st_size == expected):
@@ -647,7 +702,8 @@ async def download_worker():
                 state["last_bytes"] = current
                 state["last_t"] = now
 
-            saved = await msg.download(
+            saved = await app.download_media(
+                media_source,
                 file_name=str(temp),
                 progress=progress,
             )
@@ -698,12 +754,12 @@ async def download_worker():
             cancel_current = False
 
 
-async def main():
+async def bot_main():
     global worker_task
     init_db()
     await app.start()
     me = await app.get_me()
-    log.info("Started as @%s (id=%s)", me.username, me.id)
+    log.info("Started as @%s (id=%s) build=%s", me.username, me.id, BUILD)
     log.info("Pyrogram/PyroFork version active; .env=%s", ROOT / ".env")
     log.info("ADMIN_IDS=%s", sorted(ADMIN_IDS))
     log.info("Upload mode starts OFF")
@@ -713,7 +769,7 @@ async def main():
         with suppress(Exception):
             await app.send_message(
                 uid,
-                f"✅ @{me.username} started with Pyrogram. Upload mode is OFF.\nSend /ping.",
+                f"✅ @{me.username} started with Pyrogram. Upload mode is OFF.\nBuild: `{BUILD}`\nSend /ping.",
             )
     try:
         await idle()
@@ -725,5 +781,16 @@ async def main():
         await app.stop()
 
 
+def main():
+    # IMPORTANT: Pyrogram Client was constructed on its own event loop.
+    # Use Client.run(coroutine), not asyncio.run(), so dispatcher tasks and
+    # handlers execute on the same loop. This mirrors the known-working bot.
+    acquire_instance_lock()
+    try:
+        app.run(bot_main())
+    finally:
+        release_instance_lock()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

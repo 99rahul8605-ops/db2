@@ -67,6 +67,7 @@ git pull
 - `/start` or `/help`
 - `/ping`
 - `/whoami`
+- `/version`
 - `/upload_on`
 - `/upload_off`
 - `/upload_status`
@@ -95,3 +96,16 @@ git pull
 `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` come from `my.telegram.org/apps`, not BotFather. `BOT_TOKEN` comes from BotFather.
 
 Never commit `.env` to GitHub.
+
+## Important lifecycle fix
+
+This build intentionally starts PyroFork with `app.run(bot_main())`, matching the older working manager bot. Do **not** change it to `asyncio.run(...)`; doing that can put Pyrogram dispatcher tasks on a different event loop and cause the exact symptom where startup/outgoing messages work but incoming commands do not.
+
+After updating, verify the running code with:
+
+```text
+/version
+/ping
+```
+
+The build should report `pyro-loopfix-2026-10-16-1`.

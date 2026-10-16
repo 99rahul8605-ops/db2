@@ -119,8 +119,18 @@ async def run_cmd(args, cwd=None):
 async def edit_safe(msg, text):
     try:
         await msg.edit(text)
-    except Exception:
-        pass
+        return True
+    except Exception as e:
+        log.debug('Status edit skipped: %s: %s', type(e).__name__, e)
+        return False
+
+
+def progress_bar(done, total, width=12):
+    if not total or total <= 0:
+        return '░' * width
+    ratio = max(0.0, min(1.0, done / total))
+    filled = int(ratio * width)
+    return '█' * filled + '░' * (width - filled)
 
 
 async def download_worker():
@@ -134,29 +144,45 @@ async def download_worker():
             size = int(getattr(f, 'size', 0) or 0)
             dest = UPLOAD_DIR / name
             current = name
-            status = await event.reply(f'⬇️ Starting `{name}`\nQueue waiting: {queue.qsize()}')
+            status = await event.reply(
+                f'⬇️ Starting `{name}`\n'
+                f'Size: {human_size(size)}\n'
+                f'Queue waiting: {queue.qsize()}'
+            )
             started = time.monotonic()
-            state = {'last': 0.0, 'last_bytes': 0, 'last_t': started}
+            state = {'last_update': 0.0, 'last_bytes': 0, 'last_t': started}
 
-            def progress(done, total):
+            async def progress(done, total):
                 now = time.monotonic()
-                if done < total and now - state['last'] < 3:
+                if total and done < total and (now - state['last_update']) < 4.0:
                     return
-                dt = max(now - state['last_t'], .001)
-                speed = max(done - state['last_bytes'], 0) / dt
-                if speed <= 0:
-                    speed = done / max(now - started, .001)
-                eta = (total-done)/speed if speed else 0
-                pct = (done*100/total) if total else 0
-                text = (f'⬇️ Downloading `{name}`\n'
-                        f'{human_size(done)} / {human_size(total)} • {pct:.1f}%\n'
-                        f'Speed: {human_size(speed)}/s • ETA: {fmt_eta(eta)}\n'
-                        f'Queue waiting: {queue.qsize()}')
-                asyncio.create_task(edit_safe(status, text))
-                state.update(last=now, last_bytes=done, last_t=now)
+                dt = max(now - state['last_t'], 0.001)
+                delta = max(done - state['last_bytes'], 0)
+                speed = delta / dt if delta else done / max(now - started, 0.001)
+                eta = ((total - done) / speed) if total and speed > 0 else 0
+                pct = (done * 100 / total) if total else 0.0
+                text = (
+                    f'⬇️ Downloading `{name}`\n'
+                    f'[{progress_bar(done, total)}] {pct:.1f}%\n'
+                    f'{human_size(done)} / {human_size(total)}\n'
+                    f'Speed: {human_size(speed)}/s • ETA: {fmt_eta(eta)}\n'
+                    f'Queue waiting: {queue.qsize()}'
+                )
+                await edit_safe(status, text)
+                state['last_update'] = now
+                state['last_bytes'] = done
+                state['last_t'] = now
 
             await client.download_media(msg, file=str(dest), progress_callback=progress)
-            await edit_safe(status, f'✅ Downloaded `{name}`\nSize: {human_size(dest.stat().st_size)}\nQueue waiting: {queue.qsize()}')
+            elapsed = max(time.monotonic() - started, 0.001)
+            avg = dest.stat().st_size / elapsed if dest.exists() else 0
+            await edit_safe(
+                status,
+                f'✅ Downloaded `{name}`\n'
+                f'Size: {human_size(dest.stat().st_size)}\n'
+                f'Average: {human_size(avg)}/s\n'
+                f'Queue waiting: {queue.qsize()}'
+            )
         except Exception as e:
             log.exception('Download failed')
             try:

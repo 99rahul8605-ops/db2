@@ -56,3 +56,64 @@ Existing upload/key/lookup commands remain available:
 ```
 
 API binds to `127.0.0.1` by default. API keys are managed by the same Telegram bot.
+
+
+## Public IP:port access
+
+This build can expose the FastAPI service on the server's public IP while keeping every
+lookup endpoint protected by API keys.
+
+From the same Telegram bot:
+
+```text
+/public_on CONFIRM
+/public_url
+/api_status
+```
+
+`/public_url` returns an address like:
+
+```text
+http://203.0.113.10:8080
+```
+
+Remote client example:
+
+```bash
+curl -H "X-API-Key: YOUR_GENERATED_KEY" \
+  "http://SERVER_PUBLIC_IP:8080/lookup?number=9999999891"
+```
+
+Turn public binding off:
+
+```text
+/public_off CONFIRM
+```
+
+Default `.env.example` settings:
+
+```env
+API_HOST=0.0.0.0
+API_PORT=8080
+RATE_LIMIT_PER_MIN=60
+```
+
+If public-IP auto detection is wrong, set:
+
+```env
+PUBLIC_HOST=YOUR_PUBLIC_IP
+```
+
+### Network/provider firewall
+
+The application can bind to `0.0.0.0:8080`, but your hosting provider may still block
+incoming TCP/8080. In that case, allow TCP port 8080 in the provider firewall/security
+group. Do not open any database files or SQLite ports.
+
+### Security note
+
+API keys are mandatory and can be generated/revoked from the Telegram bot. The API has
+no Swagger/Redoc pages, applies a per-key rate limit, and marks responses `no-store`.
+
+Raw `http://IP:PORT` does **not encrypt the API key or response in transit**. It is okay
+for controlled testing, but HTTPS is safer for use across untrusted networks.

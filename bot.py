@@ -8,6 +8,7 @@ import sqlite3
 import time
 import subprocess
 import signal
+import urllib.request
 from contextlib import suppress
 from functools import wraps
 from pathlib import Path
@@ -28,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("hitek-unified-manager")
-BUILD = "hitek-bot-control-all-2026-10-17-2"
+BUILD = "hitek-bot-public-ip-port-2026-10-17-3"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
@@ -57,6 +58,8 @@ API_LOG = ROOT / "api.log"
 ZIP_PATH = Path(os.getenv("ZIP_PATH", str(EXTRACT_DIR / "users_data.zip"))).resolve()
 API_HOST = os.getenv("API_HOST", "127.0.0.1").strip() or "127.0.0.1"
 API_PORT = int(os.getenv("API_PORT", "8080") or 8080)
+PUBLIC_HOST = os.getenv("PUBLIC_HOST", "").strip()
+RATE_LIMIT_PER_MIN = max(1, min(10000, int(os.getenv("RATE_LIMIT_PER_MIN", "60") or 60)))
 _INSTANCE_LOCK_FH = None
 
 if not BOT_TOKEN:
@@ -264,6 +267,74 @@ def _start_api():
     return ("started" if started else "running"), pid
 
 
+
+def _set_env_value(key: str, value: str):
+    """Persist a simple KEY=value setting without touching secrets."""
+    path = ROOT / ".env"
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = text.splitlines()
+    out = []
+    found = False
+    for line in lines:
+        if line.startswith(key + "="):
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        if out and out[-1] != "":
+            out.append("")
+        out.append(f"{key}={value}")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def _public_ip():
+    if PUBLIC_HOST:
+        return PUBLIC_HOST
+    try:
+        req = urllib.request.Request(
+            "https://api.ipify.org",
+            headers={"User-Agent": "hitek-bot/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as r:
+            ip = r.read(128).decode("ascii", errors="ignore").strip()
+        if re.fullmatch(r"[0-9a-fA-F:.]+", ip):
+            return ip
+    except Exception:
+        pass
+    return None
+
+
+def _public_url():
+    ip = _public_ip()
+    return f"http://{ip}:{API_PORT}" if ip else None
+
+
+def _api_urls_text():
+    public = _public_url()
+    bind = f"http://{API_HOST}:{API_PORT}"
+    local = f"http://127.0.0.1:{API_PORT}"
+    lines = [
+        f"Bind: {bind}",
+        f"Local: {local}",
+    ]
+    if API_HOST == "0.0.0.0":
+        lines.append(f"Public: {public or 'public IP detection failed'}")
+    else:
+        lines.append("Public: OFF (localhost-only)")
+    lines.append(f"Per-key rate limit: {RATE_LIMIT_PER_MIN}/minute")
+    return "\n".join(lines)
+
+
+def _restart_api_if_running():
+    alive, _ = _proc_status(API_PID_FILE)
+    if alive:
+        _stop_detached(API_PID_FILE)
+        if _lookup_ready():
+            return _start_api()
+    return ("configured", None)
+
+
 def _workflow_text():
     import_alive, import_pid = _proc_status(IMPORT_PID_FILE)
     api_alive, api_pid = _proc_status(API_PID_FILE)
@@ -284,7 +355,8 @@ def _workflow_text():
         f"Rate: {rate} rec/s\n"
         f"Importer: {'🟢 PID '+str(import_pid) if import_alive else '⚪ stopped'}\n"
         f"API: {'🟢 PID '+str(api_pid) if api_alive else '⚪ stopped'}\n"
-        f"API URL: http://{API_HOST}:{API_PORT}"
+        f"API bind: http://{API_HOST}:{API_PORT}\n"
+        f"Public URL: {_public_url() or '-'}"
     )
 
 
@@ -593,6 +665,7 @@ async def start_handler(client: Client, message: Message):
         "IMPORT / API\n"
         "/import_start • /import_status • /import_stop CONFIRM\n"
         "/api_start • /api_status • /api_stop CONFIRM\n"
+        "/public_on CONFIRM • /public_off CONFIRM • /public_url\n"
         "/logs import [lines] • /logs api [lines]\n\n"
         "API KEYS\n"
         "/genkey <name> [days|never] • /keys • /key <id>\n"
@@ -889,7 +962,7 @@ async def api_start_handler(client: Client, message: Message):
     try:
         state, pid = _start_api()
         await message.reply_text(
-            f"✅ API {state}. PID={pid}\nhttp://{API_HOST}:{API_PORT}"
+            f"✅ API {state}. PID={pid}\n{_api_urls_text()}"
         )
     except Exception as e:
         await message.reply_text(f"❌ API start failed: {type(e).__name__}: {e}")
@@ -902,7 +975,7 @@ async def api_status_handler(client: Client, message: Message):
     await message.reply_text(
         ("API: 🟢 running" if alive else "API: ⚪ stopped")
         + (f" PID={pid}" if pid else "")
-        + f"\nURL: http://{API_HOST}:{API_PORT}"
+        + "\n" + _api_urls_text()
         + f"\nLookup ready: {_lookup_ready()}"
         + "\n\nAPI log:\n"
         + _tail(API_LOG, 12, 1800)
@@ -919,6 +992,61 @@ async def api_stop_handler(client: Client, message: Message):
         ("✅ API stopped" if stopped else "ℹ️ API not running")
         + (f" (PID {pid})" if pid else "")
     )
+
+
+
+@app.on_message(filters.command(["public_url", "network"]))
+@admin_only
+async def public_url_handler(client: Client, message: Message):
+    await message.reply_text(
+        "🌐 API network\n"
+        + _api_urls_text()
+        + "\n\nRemote request requires a valid X-API-Key."
+    )
+
+
+@app.on_message(filters.command("public_on"))
+@admin_only
+async def public_on_handler(client: Client, message: Message):
+    global API_HOST
+    if len(message.command or []) < 2 or message.command[1] != "CONFIRM":
+        return await message.reply_text(
+            "Use: /public_on CONFIRM\n"
+            "This binds the API to 0.0.0.0 so it can be reached via server IP:port."
+        )
+    API_HOST = "0.0.0.0"
+    _set_env_value("API_HOST", API_HOST)
+    try:
+        state, pid = await asyncio.to_thread(_restart_api_if_running)
+        await message.reply_text(
+            "✅ Public IP:port mode enabled.\n"
+            + _api_urls_text()
+            + (f"\nAPI {state}" + (f" PID={pid}" if pid else "") if state else "")
+            + "\n\nAll lookup endpoints still require X-API-Key."
+        )
+    except Exception as e:
+        await message.reply_text(
+            f"✅ Public mode saved, but API restart failed: {type(e).__name__}: {e}\n"
+            + _api_urls_text()
+        )
+
+
+@app.on_message(filters.command("public_off"))
+@admin_only
+async def public_off_handler(client: Client, message: Message):
+    global API_HOST
+    if len(message.command or []) < 2 or message.command[1] != "CONFIRM":
+        return await message.reply_text("Use: /public_off CONFIRM")
+    API_HOST = "127.0.0.1"
+    _set_env_value("API_HOST", API_HOST)
+    try:
+        state, pid = await asyncio.to_thread(_restart_api_if_running)
+        await message.reply_text(
+            "✅ Public access disabled; API is localhost-only.\n"
+            + _api_urls_text()
+        )
+    except Exception as e:
+        await message.reply_text(f"⚠️ Saved localhost mode but restart failed: {e}")
 
 
 @app.on_message(filters.command("logs"))

@@ -1,6 +1,9 @@
 import os
 import re
 import sqlite3
+import threading
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,14 +16,41 @@ load_dotenv(ROOT / ".env")
 LOOKUP_DB = Path(os.getenv("LOOKUP_DB", str(ROOT / "lookup/users_lookup.db"))).resolve()
 KEYS_DB = Path(os.getenv("KEYS_DB", str(ROOT / "api_keys.db"))).resolve()
 MAX_RESULTS = max(1, min(50, int(os.getenv("MAX_LOOKUP_RESULTS", "10") or 10)))
+RATE_LIMIT_PER_MIN = max(1, min(10000, int(os.getenv("RATE_LIMIT_PER_MIN", "60") or 60)))
+_RATE_LOCK = threading.Lock()
+_RATE = defaultdict(deque)
 
 key_store.init_db(KEYS_DB)
 app = FastAPI(title="Hitek Private Lookup API", docs_url=None, redoc_url=None)
 
 
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+def _check_rate_limit(key_id: int):
+    now = time.monotonic()
+    cutoff = now - 60.0
+    with _RATE_LOCK:
+        q = _RATE[key_id]
+        while q and q[0] < cutoff:
+            q.popleft()
+        if len(q) >= RATE_LIMIT_PER_MIN:
+            raise HTTPException(429, "Rate limit exceeded")
+        q.append(now)
+
+
 def auth(x_api_key):
-    if not key_store.validate_key(KEYS_DB, x_api_key or ""):
+    info = key_store.validate_key(KEYS_DB, x_api_key or "")
+    if not info:
         raise HTTPException(401, "Invalid, disabled, or expired API key")
+    _check_rate_limit(int(info["id"]))
+    return info
 
 
 def con():

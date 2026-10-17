@@ -5,26 +5,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-def _now() -> datetime:
+def _connect(db_path: Path):
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path), timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    return con
+
+
+def _now():
     return datetime.now(timezone.utc)
 
 
-def _iso(dt: datetime | None) -> str | None:
-    return dt.isoformat() if dt else None
-
-
-def _connect(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
-
-
-def init_db(path: Path):
-    with _connect(path) as conn:
-        conn.execute("""
+def init_db(db_path: Path):
+    with _connect(db_path) as con:
+        con.execute("""
             CREATE TABLE IF NOT EXISTS api_keys (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -38,119 +35,88 @@ def init_db(path: Path):
                 use_count INTEGER NOT NULL DEFAULT 0
             )
         """)
-        conn.commit()
+        cols = {r[1] for r in con.execute("PRAGMA table_info(api_keys)").fetchall()}
+        if "expires_at" not in cols:
+            con.execute("ALTER TABLE api_keys ADD COLUMN expires_at TEXT")
+        con.commit()
 
 
 def hash_key(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def generate_key(path: Path, name: str, created_by: int | None = None, days: int | None = None):
-    init_db(path)
-    name = name.strip()
-    if not name:
-        raise ValueError("Key name required")
-    raw = "hk_" + secrets.token_urlsafe(40)
+def generate_key(db_path: Path, name: str, created_by: int, days=None):
+    raw = "htk_" + secrets.token_urlsafe(40)
     now = _now()
-    expires = now + timedelta(days=days) if days and days > 0 else None
-    with _connect(path) as conn:
-        cur = conn.execute("""
-            INSERT INTO api_keys(name,key_hash,key_prefix,enabled,created_at,created_by,expires_at)
-            VALUES(?,?,?,?,?,?,?)
-        """, (name, hash_key(raw), raw[:12], 1, _iso(now), created_by, _iso(expires)))
-        conn.commit()
-        key_id = cur.lastrowid
-    return {"id": key_id, "name": name, "key": raw, "prefix": raw[:12], "created_at": _iso(now), "expires_at": _iso(expires)}
+    expires = now + timedelta(days=days) if days else None
+    with _connect(db_path) as con:
+        cur = con.execute(
+            "INSERT INTO api_keys(name,key_hash,key_prefix,enabled,created_at,created_by,expires_at) VALUES(?,?,?,?,?,?,?)",
+            (name, hash_key(raw), raw[:12], 1, now.isoformat(), created_by, expires.isoformat() if expires else None),
+        )
+        con.commit()
+    return {"id": cur.lastrowid, "name": name, "key": raw, "expires_at": expires.isoformat() if expires else None}
 
 
-def list_keys(path: Path, limit: int = 100):
-    init_db(path)
-    with _connect(path) as conn:
-        rows = conn.execute("""
-            SELECT id,name,key_prefix,enabled,created_at,created_by,expires_at,last_used_at,use_count
-            FROM api_keys ORDER BY id DESC LIMIT ?
-        """, (max(1, min(limit, 500)),)).fetchall()
-        return [dict(r) for r in rows]
+def list_keys(db_path: Path):
+    with _connect(db_path) as con:
+        return [dict(r) for r in con.execute(
+            "SELECT id,name,key_prefix,enabled,created_at,created_by,expires_at,last_used_at,use_count FROM api_keys ORDER BY id DESC"
+        ).fetchall()]
 
 
-def get_key(path: Path, key_id: int):
-    init_db(path)
-    with _connect(path) as conn:
-        row = conn.execute("""
-            SELECT id,name,key_prefix,enabled,created_at,created_by,expires_at,last_used_at,use_count
-            FROM api_keys WHERE id=?
-        """, (key_id,)).fetchone()
-        return dict(row) if row else None
+def get_key(db_path: Path, key_id: int):
+    with _connect(db_path) as con:
+        r = con.execute("SELECT * FROM api_keys WHERE id=?", (key_id,)).fetchone()
+        return dict(r) if r else None
 
 
-def set_enabled(path: Path, key_id: int, enabled: bool) -> bool:
-    with _connect(path) as conn:
-        cur = conn.execute("UPDATE api_keys SET enabled=? WHERE id=?", (1 if enabled else 0, key_id))
-        conn.commit()
+def set_enabled(db_path: Path, key_id: int, enabled: bool):
+    with _connect(db_path) as con:
+        cur = con.execute("UPDATE api_keys SET enabled=? WHERE id=?", (1 if enabled else 0, key_id))
+        con.commit()
         return cur.rowcount > 0
 
 
-def rename_key(path: Path, key_id: int, name: str) -> bool:
-    name = name.strip()
-    if not name:
+def rename_key(db_path: Path, key_id: int, name: str):
+    if not name.strip():
         return False
-    with _connect(path) as conn:
-        cur = conn.execute("UPDATE api_keys SET name=? WHERE id=?", (name, key_id))
-        conn.commit()
+    with _connect(db_path) as con:
+        cur = con.execute("UPDATE api_keys SET name=? WHERE id=?", (name.strip(), key_id))
+        con.commit()
         return cur.rowcount > 0
 
 
-def set_expiry(path: Path, key_id: int, days: int | None) -> bool:
-    expires = None if not days or days <= 0 else _now() + timedelta(days=days)
-    with _connect(path) as conn:
-        cur = conn.execute("UPDATE api_keys SET expires_at=? WHERE id=?", (_iso(expires), key_id))
-        conn.commit()
+def set_expiry(db_path: Path, key_id: int, days=None):
+    exp = (_now() + timedelta(days=days)).isoformat() if days else None
+    with _connect(db_path) as con:
+        cur = con.execute("UPDATE api_keys SET expires_at=? WHERE id=?", (exp, key_id))
+        con.commit()
+        return cur.rowcount > 0, exp
+
+
+def delete_key(db_path: Path, key_id: int):
+    with _connect(db_path) as con:
+        cur = con.execute("DELETE FROM api_keys WHERE id=?", (key_id,))
+        con.commit()
         return cur.rowcount > 0
 
 
-def delete_key(path: Path, key_id: int) -> bool:
-    with _connect(path) as conn:
-        cur = conn.execute("DELETE FROM api_keys WHERE id=?", (key_id,))
-        conn.commit()
-        return cur.rowcount > 0
-
-
-def validate_key(path: Path, raw: str, record_use: bool = True):
+def validate_key(db_path: Path, raw: str):
     if not raw:
         return None
-    init_db(path)
-    h = hash_key(raw)
     now = _now()
-    with _connect(path) as conn:
-        row = conn.execute("""
-            SELECT id,name,key_prefix,enabled,created_at,created_by,expires_at,last_used_at,use_count
-            FROM api_keys WHERE key_hash=?
-        """, (h,)).fetchone()
-        if not row or not row["enabled"]:
+    with _connect(db_path) as con:
+        r = con.execute("SELECT * FROM api_keys WHERE key_hash=? AND enabled=1", (hash_key(raw),)).fetchone()
+        if not r:
             return None
-        if row["expires_at"]:
+        d = dict(r)
+        if d.get("expires_at"):
             try:
-                exp = datetime.fromisoformat(row["expires_at"])
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-                if exp <= now:
+                if datetime.fromisoformat(d["expires_at"]) <= now:
                     return None
-            except ValueError:
+            except Exception:
                 return None
-        if record_use:
-            conn.execute("UPDATE api_keys SET last_used_at=?, use_count=use_count+1 WHERE id=?", (_iso(now), row["id"]))
-            conn.commit()
-        return dict(row)
-
-
-def stats(path: Path):
-    init_db(path)
-    now = _iso(_now())
-    with _connect(path) as conn:
-        total = conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0]
-        active = conn.execute("""
-            SELECT COUNT(*) FROM api_keys
-            WHERE enabled=1 AND (expires_at IS NULL OR expires_at>?)
-        """, (now,)).fetchone()[0]
-        uses = conn.execute("SELECT COALESCE(SUM(use_count),0) FROM api_keys").fetchone()[0]
-    return {"total": total, "active": active, "uses": uses}
+        con.execute("UPDATE api_keys SET last_used_at=?, use_count=use_count+1 WHERE id=?", (now.isoformat(), d["id"]))
+        con.commit()
+        return d

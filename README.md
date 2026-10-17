@@ -1,125 +1,58 @@
-# Hitek Private Lookup + API Key Manager
+# Hitek One-Bot Control Panel
 
-Complete private stack:
+One Telegram bot controls the whole workflow: large parallel uploads, 7z validation/extraction, ZIP→SQLite import/indexing, local API process, API keys, and direct lookups.
 
-- streams `users_data.json` directly from `/root/db2/extracted/users_data.zip`
-- stores all observed fields: `_id`, `mobile`, `name`, `fname`, `address`, `alt`, `circle`, `id`, `email`
-- indexes `mobile`, `alt`, and `id`
-- private FastAPI with generated API keys
-- Telegram admin manager for key generation/revoke/expiry/stats
-- direct admin `/lookup <number>`
-
-## Important
-Your upload bot already polls Telegram. Use a **separate BotFather token** for `MANAGER_BOT_TOKEN`; two polling programs cannot reliably share one bot token.
-
-## Install
+## First install only
 
 ```bash
 bash install.sh
 nano .env
+./run_screen.sh
 ```
 
-Required `.env` values:
+## Normal workflow from Telegram
 
-```env
-MANAGER_BOT_TOKEN=NEW_SEPARATE_MANAGER_BOT_TOKEN
-ADMIN_IDS=YOUR_TELEGRAM_NUMERIC_ID
-ZIP_PATH=/root/db2/extracted/users_data.zip
-DB_PATH=/root/db2/lookup/users_lookup.db
-KEYS_DB_PATH=/root/db2/lookup/api_keys.db
-BIND_HOST=127.0.0.1
-BIND_PORT=8080
-SHOW_FULL_FIELDS=1
-```
-
-## Optional quick test: first 100k records
-
-```bash
-./venv/bin/python3 import_users.py --fresh --limit 100000
-./start_all.sh
-```
-
-Later rebuild full DB:
-
-```bash
-./venv/bin/python3 import_users.py --fresh
-```
-
-## Full import in background
-
-```bash
-./run_import_screen.sh
-```
-
-Watch:
-
-```bash
-tail -f logs/import.log
-```
-
-The 446 GiB JSON is not extracted to disk first. If import stops, run the importer again; it uses the last committed record checkpoint (the Deflate stream still has to be re-read to reach that point).
-
-## Start API + manager bot
-
-```bash
-./start_all.sh
-./status.sh
-```
-
-Manager commands:
+1. `/upload_on` then forward all archive parts.
+2. `/parts` to verify all volumes.
+3. Send:
 
 ```text
-/genkey <name> [days|never]
-/keys [limit]
-/key <id>
-/disable <id>    (or /revoke <id>)
-/enable <id>
-/rename <id> <new name>
-/expire <id> <days|never>
-/delete <id> CONFIRM
-/lookup <number>
-/id <record_id>
-/stats
-/health
-/whoami
+/buildall CONFIRM
 ```
 
-Raw generated keys are shown only once; only SHA-256 hashes are stored.
+That single command will:
 
-## API example
-Generate a key with `/genkey main_bot 30`, then:
+- turn uploads OFF
+- test/extract the split 7z if `users_data.zip` is not already present
+- start/resume streaming import from `users_data.zip` (the 446 GiB JSON is not separately extracted)
+- build indexes on `mobile`, `alt`, and `id`
+- automatically start the private FastAPI service when indexing finishes
+- notify admins when ready
 
-```bash
-curl -s -H 'X-API-Key: hk_...' 'http://127.0.0.1:8080/lookup?number=9999999891'
-```
+Import runs as a detached server process, so closing RDP/laptop does not stop it. Its checkpoint is stored in SQLite.
 
-Endpoints:
+## Bot control commands
 
 ```text
-GET /lookup?number=...
-GET /user/{mobile}
-GET /id/{record_id}
-GET /stats
-GET /health     (no key; status only)
+/buildall CONFIRM
+/workflow
+/import_start
+/import_status
+/import_stop CONFIRM
+/api_start
+/api_status
+/api_stop CONFIRM
+/logs import 30
+/logs api 30
 ```
 
-## Existing upload bot
-After `/genkey`, put the generated key in your upload bot `.env`:
+Existing upload/key/lookup commands remain available:
 
-```env
-LOOKUP_API_URL=http://127.0.0.1:8080
-LOOKUP_API_KEY=hk_...
+```text
+/upload_on /upload_off /queue /retryfailed
+/parts /test7z /extract7z CONFIRM
+/genkey <name> [days|never] /keys /disable /enable
+/lookup <number> /id <record_id> /stats
 ```
 
-Then adapt `pyrogram_lookup_snippet.py` into the existing bot.
-
-## CLI fallback
-
-```bash
-./venv/bin/python3 key_cli.py generate main_bot --days 30
-./venv/bin/python3 key_cli.py list
-./venv/bin/python3 key_cli.py disable 1
-./venv/bin/python3 key_cli.py enable 1
-```
-
-Keep the API on `127.0.0.1` when your bot is on the same server. Do not commit `.env`, raw API keys, or generated databases to Git.
+API binds to `127.0.0.1` by default. API keys are managed by the same Telegram bot.

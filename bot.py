@@ -6,6 +6,8 @@ import re
 import shutil
 import sqlite3
 import time
+import subprocess
+import signal
 from contextlib import suppress
 from functools import wraps
 from pathlib import Path
@@ -16,6 +18,8 @@ from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import Message
 from pyrogram.file_id import FileId
 
+import key_store
+
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
@@ -23,8 +27,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("hitek-upload-bot")
-BUILD = "pyro-parallel4-retry-2026-10-16-4"
+log = logging.getLogger("hitek-unified-manager")
+BUILD = "hitek-bot-control-all-2026-10-17-2"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
@@ -36,6 +40,9 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(ROOT / "uploads"))).resolve()
 EXTRACT_DIR = Path(os.getenv("EXTRACT_DIR", str(ROOT / "extracted"))).resolve()
 STATE_DB = Path(os.getenv("STATE_DB", str(ROOT / "queue.db"))).resolve()
 SESSION_DIR = Path(os.getenv("SESSION_DIR", str(ROOT / "session"))).resolve()
+KEYS_DB = Path(os.getenv("KEYS_DB", str(ROOT / "api_keys.db"))).resolve()
+LOOKUP_DB = Path(os.getenv("LOOKUP_DB", str(ROOT / "lookup" / "users_lookup.db"))).resolve()
+MAX_LOOKUP_RESULTS = max(1, min(50, int(os.getenv("MAX_LOOKUP_RESULTS", "10") or 10)))
 PARALLEL_STREAMS = max(1, min(8, int(os.getenv("PARALLEL_STREAMS", "4") or 4)))
 PROGRESS_INTERVAL = max(2.0, float(os.getenv("PROGRESS_INTERVAL", "3") or 3))
 STREAM_RETRIES = max(1, min(50, int(os.getenv("STREAM_RETRIES", "12") or 12)))
@@ -43,6 +50,13 @@ STREAM_RETRY_DELAY = max(0.5, float(os.getenv("STREAM_RETRY_DELAY", "2") or 2))
 TG_CHUNK_SIZE = 1024 * 1024  # Pyrogram get_file() range unit is 1 MiB
 PID_FILE = ROOT / ".bot.pid"
 LOCK_FILE = ROOT / ".bot.lock"
+IMPORT_PID_FILE = ROOT / ".import.pid"
+API_PID_FILE = ROOT / ".api.pid"
+IMPORT_LOG = ROOT / "import.log"
+API_LOG = ROOT / "api.log"
+ZIP_PATH = Path(os.getenv("ZIP_PATH", str(EXTRACT_DIR / "users_data.zip"))).resolve()
+API_HOST = os.getenv("API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+API_PORT = int(os.getenv("API_PORT", "8080") or 8080)
 _INSTANCE_LOCK_FH = None
 
 if not BOT_TOKEN:
@@ -54,9 +68,10 @@ if not API_HASH:
 if not ADMIN_IDS:
     raise SystemExit("ADMIN_IDS missing in .env")
 
-for p in (UPLOAD_DIR, EXTRACT_DIR, SESSION_DIR):
+for p in (UPLOAD_DIR, EXTRACT_DIR, SESSION_DIR, LOOKUP_DB.parent):
     p.mkdir(parents=True, exist_ok=True)
 STATE_DB.parent.mkdir(parents=True, exist_ok=True)
+KEYS_DB.parent.mkdir(parents=True, exist_ok=True)
 
 
 def acquire_instance_lock():
@@ -109,6 +124,217 @@ current_job_id = None
 current_name = None
 current_started = None
 cancel_current = False
+pipeline_task = None
+
+
+def _read_pid(path: Path):
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def _pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _proc_status(pid_file: Path):
+    pid = _read_pid(pid_file)
+    if pid and _pid_alive(pid):
+        return True, pid
+    if pid_file.exists():
+        with suppress(Exception):
+            pid_file.unlink()
+    return False, None
+
+
+def _start_detached(cmd, pid_file: Path, log_file: Path):
+    alive, pid = _proc_status(pid_file)
+    if alive:
+        return False, pid
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(log_file, "ab", buffering=0)
+    proc = subprocess.Popen(
+        [str(x) for x in cmd],
+        cwd=str(ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+    )
+    log_fh.close()
+    pid_file.write_text(str(proc.pid), encoding="utf-8")
+    return True, proc.pid
+
+
+def _stop_detached(pid_file: Path):
+    alive, pid = _proc_status(pid_file)
+    if not alive:
+        return False, None
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        with suppress(Exception):
+            os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.1)
+    if _pid_alive(pid):
+        with suppress(Exception):
+            os.killpg(pid, signal.SIGKILL)
+    with suppress(Exception):
+        pid_file.unlink()
+    return True, pid
+
+
+def _tail(path: Path, lines=25, max_chars=3500):
+    if not path.exists():
+        return "(no log yet)"
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            text = f.read().decode(errors="replace")
+        out = "\n".join(text.splitlines()[-max(1, lines):])
+        return out[-max_chars:]
+    except Exception as e:
+        return f"log read error: {e}"
+
+
+def _lookup_meta():
+    meta = {}
+    if not LOOKUP_DB.exists():
+        return meta
+    try:
+        con = sqlite3.connect(f"file:{LOOKUP_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute("SELECT key,value FROM import_meta").fetchall()
+            meta = {str(k): str(v) for k, v in rows}
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return meta
+
+
+def _lookup_ready():
+    meta = _lookup_meta()
+    return LOOKUP_DB.exists() and meta.get("completed") == "1" and meta.get("phase") in {None, "ready"}
+
+
+def _start_import():
+    meta = _lookup_meta()
+    if meta.get("completed") == "1" and meta.get("phase") in {None, "ready"}:
+        return "complete", None
+    python = ROOT / "venv" / "bin" / "python3"
+    if not python.exists():
+        raise RuntimeError("venv missing; run bash install.sh once")
+    if not ZIP_PATH.exists():
+        raise RuntimeError(f"Source ZIP not found: {ZIP_PATH}")
+    started, pid = _start_detached([python, ROOT / "import_users.py"], IMPORT_PID_FILE, IMPORT_LOG)
+    return ("started" if started else "running"), pid
+
+
+def _start_api():
+    if not _lookup_ready():
+        raise RuntimeError("Lookup DB is not fully imported/indexed yet")
+    uvicorn = ROOT / "venv" / "bin" / "uvicorn"
+    if not uvicorn.exists():
+        raise RuntimeError("uvicorn missing; run bash install.sh once")
+    started, pid = _start_detached(
+        [uvicorn, "api:app", "--host", API_HOST, "--port", str(API_PORT), "--workers", "1"],
+        API_PID_FILE,
+        API_LOG,
+    )
+    return ("started" if started else "running"), pid
+
+
+def _workflow_text():
+    import_alive, import_pid = _proc_status(IMPORT_PID_FILE)
+    api_alive, api_pid = _proc_status(API_PID_FILE)
+    meta = _lookup_meta()
+    zip_state = f"✅ {human_size(ZIP_PATH.stat().st_size)}" if ZIP_PATH.exists() else "❌ missing"
+    db_state = f"✅ {human_size(LOOKUP_DB.stat().st_size)}" if LOOKUP_DB.exists() else "❌ missing"
+    phase = meta.get("phase", "-")
+    processed = meta.get("processed_records", "0")
+    inserted = meta.get("inserted_records", "0")
+    rate = meta.get("last_rate", "-")
+    return (
+        "🧭 Pipeline status\n"
+        f"Source ZIP: {zip_state}\n"
+        f"Lookup DB: {db_state}\n"
+        f"Phase: {phase}\n"
+        f"Processed: {processed}\n"
+        f"Inserted: {inserted}\n"
+        f"Rate: {rate} rec/s\n"
+        f"Importer: {'🟢 PID '+str(import_pid) if import_alive else '⚪ stopped'}\n"
+        f"API: {'🟢 PID '+str(api_pid) if api_alive else '⚪ stopped'}\n"
+        f"API URL: http://{API_HOST}:{API_PORT}"
+    )
+
+
+async def _notify_admins(text: str):
+    for uid in ADMIN_IDS:
+        with suppress(Exception):
+            await app.send_message(uid, text)
+
+
+async def _pipeline_monitor():
+    """Recoverable monitor: wait for importer, then start API when indexes are ready."""
+    last_notice = 0.0
+    while True:
+        meta = _lookup_meta()
+        if meta.get("completed") == "1" and meta.get("phase") in {None, "ready"}:
+            try:
+                state, pid = _start_api()
+                await _notify_admins(
+                    f"✅ Lookup DB import + indexes complete.\nAPI {state} (PID {pid}).\n"
+                    f"Use /lookup <number>, /genkey, /workflow"
+                )
+            except Exception as e:
+                await _notify_admins(f"⚠️ DB ready but API start failed: {type(e).__name__}: {e}")
+            return
+
+        alive, pid = _proc_status(IMPORT_PID_FILE)
+        if not alive:
+            # Import can exit just before final metadata becomes visible; check once more.
+            await asyncio.sleep(2)
+            meta = _lookup_meta()
+            if meta.get("completed") == "1" and meta.get("phase") in {None, "ready"}:
+                continue
+            await _notify_admins(
+                "❌ Lookup importer stopped before completion.\n"
+                f"{_workflow_text()}\n\nLast import log:\n{_tail(IMPORT_LOG, 15, 2500)}\n"
+                "Use /import_start to resume."
+            )
+            return
+
+        now = time.monotonic()
+        if now - last_notice >= 1800:  # at most every 30 minutes
+            await _notify_admins(_workflow_text())
+            last_notice = now
+        await asyncio.sleep(30)
+
+
+def _ensure_pipeline_monitor():
+    global pipeline_task
+    if pipeline_task is None or pipeline_task.done():
+        pipeline_task = asyncio.create_task(_pipeline_monitor(), name="pipeline-monitor")
 
 
 def db_conn():
@@ -356,27 +582,26 @@ async def incoming_logger(client: Client, message: Message):
 @admin_only
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
-        "🗄 Hitek Pyrogram Upload Bot\n\n"
-        "Upload safety:\n"
-        "/upload_on — enable accepting files\n"
-        "/upload_off — disable accepting new files\n"
-        "/upload_status — current mode\n\n"
-        "Queue:\n"
-        "/queue — queue summary\n"
-        "/retryfailed — retry failed downloads\n"
-        "/cancelcurrent CONFIRM — cancel current file and requeue it\n"
-        "/files — saved files\n"
-        "/parts — check .7z.001... sequence\n\n"
-        "Archive:\n"
-        "/test7z — verify archive\n"
-        "/info7z — archive info\n"
-        "/extract7z CONFIRM — extract archive\n\n"
-        "System:\n"
-        "/disk — disk + RAM\n"
-        "/ping — bot test\n"
-        "/whoami — show IDs\n"
-        "/version — show running build\n\n"
-        "Files can be forwarded in any order. Queue runs ONE file at a time; that file uses parallel Telegram ranges."
+        "🗄 Hitek One-Bot Control Panel\n\n"
+        "ONE COMMAND PIPELINE\n"
+        "/buildall CONFIRM — test/extract if needed → import/index → auto-start API\n"
+        "/workflow — current end-to-end status\n\n"
+        "UPLOAD\n"
+        "/upload_on • /upload_off • /upload_status\n"
+        "/queue • /retryfailed • /cancelcurrent CONFIRM\n"
+        "/files • /parts • /test7z • /info7z • /extract7z CONFIRM\n\n"
+        "IMPORT / API\n"
+        "/import_start • /import_status • /import_stop CONFIRM\n"
+        "/api_start • /api_status • /api_stop CONFIRM\n"
+        "/logs import [lines] • /logs api [lines]\n\n"
+        "API KEYS\n"
+        "/genkey <name> [days|never] • /keys • /key <id>\n"
+        "/disable <id> • /enable <id> • /rename <id> <name>\n"
+        "/expire <id> <days|never> • /deletekey <id> CONFIRM\n\n"
+        "LOOKUP\n"
+        "/lookup <number> • /id <record_id> • /stats\n\n"
+        "SYSTEM\n"
+        "/disk • /ping • /whoami • /version"
     )
 
 
@@ -525,24 +750,65 @@ async def disk_handler(client: Client, message: Message):
     )
 
 
+
+async def _test_archive():
+    _, items = choose_group(True)
+    first = items[0][1]
+    code, out = await run_cmd(["7z", "t", str(first)])
+    return code, out, first
+
+
+async def _extract_archive(status: Message | None = None):
+    _, items = choose_group(True)
+    first = items[0][1]
+    proc = await asyncio.create_subprocess_exec(
+        "7z", "x", str(first), f"-o{EXTRACT_DIR}", "-y", "-bb1", "-bsp1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    tail = ""
+    last_edit = 0.0
+    pct_re = re.compile(r"(\d{1,3})%")
+    while True:
+        chunk = await proc.stdout.read(4096)
+        if not chunk:
+            break
+        txt = chunk.decode(errors="replace")
+        tail = (tail + txt)[-12000:]
+        now = time.monotonic()
+        if status and now - last_edit >= 4:
+            matches = pct_re.findall(tail.replace("\r", "\n"))
+            pct = matches[-1] if matches else "working"
+            free = shutil.disk_usage(EXTRACT_DIR).free
+            await edit_safe(
+                status,
+                f"📦 Extracting {first.name}\n"
+                f"Progress: {pct}{'%' if str(pct).isdigit() else ''}\n"
+                f"Free disk: {human_size(free)}",
+            )
+            last_edit = now
+    code = await proc.wait()
+    return code, tail, first
+
+
 @app.on_message(filters.command("test7z"))
 @admin_only
 async def test7z_handler(client: Client, message: Message):
     if operation_lock.locked():
         return await message.reply_text("⚠️ Archive operation already running.")
-    base, items = choose_group(True)
-    first = items[0][1]
-    status = await message.reply_text(f"🧪 Testing {first.name} ...")
+    status = await message.reply_text("🧪 Testing split archive ...")
     async with operation_lock:
-        code, out = await run_cmd(["7z", "t", str(first)])
-    tail = out[-3500:]
-    await edit_safe(status, f"{'✅' if code == 0 else '❌'} 7z test exit={code}\n{tail}")
+        code, out, first = await _test_archive()
+    await edit_safe(
+        status,
+        f"{'✅' if code == 0 else '❌'} 7z test {first.name} exit={code}\n{out[-3500:]}"
+    )
 
 
 @app.on_message(filters.command("info7z"))
 @admin_only
 async def info7z_handler(client: Client, message: Message):
-    base, items = choose_group(True)
+    _, items = choose_group(True)
     first = items[0][1]
     code, out = await run_cmd(["7z", "l", "-slt", str(first)])
     await message.reply_text(f"exit={code}\n{out[-3500:]}")
@@ -552,48 +818,393 @@ async def info7z_handler(client: Client, message: Message):
 @admin_only
 async def extract7z_handler(client: Client, message: Message):
     if len(message.command or []) < 2 or message.command[1] != "CONFIRM":
-        return await message.reply_text("Use: `/extract7z CONFIRM`")
+        return await message.reply_text("Use: /extract7z CONFIRM")
     if operation_lock.locked():
         return await message.reply_text("⚠️ Archive operation already running.")
-    _, items = choose_group(True)
-    first = items[0][1]
-    status = await message.reply_text(f"📦 Extracting {first.name} ...")
+    status = await message.reply_text("📦 Starting archive extraction ...")
     async with operation_lock:
-        proc = await asyncio.create_subprocess_exec(
-            "7z", "x", str(first), f"-o{EXTRACT_DIR}", "-y", "-bb1", "-bsp1",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        tail = ""
-        last_edit = 0.0
-        pct_re = re.compile(r"(\d{1,3})%")
-        while True:
-            chunk = await proc.stdout.read(4096)
-            if not chunk:
-                break
-            txt = chunk.decode(errors="replace")
-            tail = (tail + txt)[-12000:]
-            now = time.monotonic()
-            if now - last_edit >= 4:
-                matches = pct_re.findall(tail.replace("\r", "\n"))
-                pct = matches[-1] if matches else "working"
-                free = shutil.disk_usage(EXTRACT_DIR).free
-                await edit_safe(
-                    status,
-                    f"📦 Extracting {first.name}\n"
-                    f"Progress: {pct}{'%' if str(pct).isdigit() else ''}\n"
-                    f"Free disk: {human_size(free)}",
-                )
-                last_edit = now
-        code = await proc.wait()
+        code, tail, first = await _extract_archive(status)
     await edit_safe(
         status,
-        f"{'✅' if code == 0 else '❌'} Extraction finished. Exit={code}\n"
+        f"{'✅' if code == 0 else '❌'} Extraction finished: {first.name} exit={code}\n"
+        f"Source ZIP: {'found' if ZIP_PATH.exists() else 'not found'}\n"
         f"Free disk: {human_size(shutil.disk_usage(EXTRACT_DIR).free)}",
     )
     if code != 0:
-        await message.reply_text(f"{tail[-3500:]}")
+        await message.reply_text(tail[-3500:])
 
+
+# ---------------- ONE-BOT pipeline/import/API controls ----------------
+
+@app.on_message(filters.command(["workflow", "pipeline_status"]))
+@admin_only
+async def workflow_handler(client: Client, message: Message):
+    await message.reply_text(_workflow_text())
+
+
+@app.on_message(filters.command("import_start"))
+@admin_only
+async def import_start_handler(client: Client, message: Message):
+    try:
+        state, pid = _start_import()
+        if state == "complete":
+            await message.reply_text(
+                "✅ Import + indexes already complete. Use /api_start or /buildall CONFIRM."
+            )
+            return
+        _ensure_pipeline_monitor()
+        await message.reply_text(
+            f"✅ Import {state}. PID={pid}\n"
+            "It runs independently in background.\n"
+            "Use /import_status."
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ Import start failed: {type(e).__name__}: {e}")
+
+
+@app.on_message(filters.command("import_status"))
+@admin_only
+async def import_status_handler(client: Client, message: Message):
+    await message.reply_text(
+        _workflow_text() + "\n\nImport log:\n" + _tail(IMPORT_LOG, 15, 2200)
+    )
+
+
+@app.on_message(filters.command("import_stop"))
+@admin_only
+async def import_stop_handler(client: Client, message: Message):
+    if len(message.command or []) < 2 or message.command[1] != "CONFIRM":
+        return await message.reply_text("Use: /import_stop CONFIRM")
+    stopped, pid = await asyncio.to_thread(_stop_detached, IMPORT_PID_FILE)
+    await message.reply_text(
+        ("✅ Import stopped" if stopped else "ℹ️ Import not running")
+        + (f" (PID {pid})" if pid else "")
+        + "\nCheckpoint is preserved; /import_start resumes safely."
+    )
+
+
+@app.on_message(filters.command("api_start"))
+@admin_only
+async def api_start_handler(client: Client, message: Message):
+    try:
+        state, pid = _start_api()
+        await message.reply_text(
+            f"✅ API {state}. PID={pid}\nhttp://{API_HOST}:{API_PORT}"
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ API start failed: {type(e).__name__}: {e}")
+
+
+@app.on_message(filters.command("api_status"))
+@admin_only
+async def api_status_handler(client: Client, message: Message):
+    alive, pid = _proc_status(API_PID_FILE)
+    await message.reply_text(
+        ("API: 🟢 running" if alive else "API: ⚪ stopped")
+        + (f" PID={pid}" if pid else "")
+        + f"\nURL: http://{API_HOST}:{API_PORT}"
+        + f"\nLookup ready: {_lookup_ready()}"
+        + "\n\nAPI log:\n"
+        + _tail(API_LOG, 12, 1800)
+    )
+
+
+@app.on_message(filters.command("api_stop"))
+@admin_only
+async def api_stop_handler(client: Client, message: Message):
+    if len(message.command or []) < 2 or message.command[1] != "CONFIRM":
+        return await message.reply_text("Use: /api_stop CONFIRM")
+    stopped, pid = await asyncio.to_thread(_stop_detached, API_PID_FILE)
+    await message.reply_text(
+        ("✅ API stopped" if stopped else "ℹ️ API not running")
+        + (f" (PID {pid})" if pid else "")
+    )
+
+
+@app.on_message(filters.command("logs"))
+@admin_only
+async def logs_handler(client: Client, message: Message):
+    args = (message.command or [])[1:]
+    if not args or args[0].lower() not in {"import", "api"}:
+        return await message.reply_text("Use: /logs import [lines] OR /logs api [lines]")
+    lines = 25
+    if len(args) > 1 and args[1].isdigit():
+        lines = max(5, min(80, int(args[1])))
+    path = IMPORT_LOG if args[0].lower() == "import" else API_LOG
+    await message.reply_text(
+        f"{args[0].upper()} log:\n{_tail(path, lines, 3800)}"
+    )
+
+
+@app.on_message(filters.command(["buildall", "setupall"]))
+@admin_only
+async def buildall_handler(client: Client, message: Message):
+    if len(message.command or []) < 2 or message.command[1] != "CONFIRM":
+        return await message.reply_text(
+            "Use: /buildall CONFIRM\n\n"
+            "It will verify/extract if needed, start/resume JSON import, build indexes, "
+            "then auto-start the local API."
+        )
+
+    global upload_mode
+    upload_mode = False
+    status = await message.reply_text(
+        "🚀 Build-all started. Upload mode turned OFF. Checking current state..."
+    )
+    try:
+        if not ZIP_PATH.exists():
+            if operation_lock.locked():
+                raise RuntimeError("archive operation already running")
+            await edit_safe(status, "🧪 Source ZIP missing. Testing split archive first...")
+            async with operation_lock:
+                code, out, first = await _test_archive()
+                if code != 0:
+                    raise RuntimeError(
+                        f"7z test failed for {first.name}: {out[-1200:]}"
+                    )
+                await edit_safe(
+                    status,
+                    f"✅ Archive valid: {first.name}\n📦 Extracting to {EXTRACT_DIR}..."
+                )
+                code, tail, first = await _extract_archive(status)
+                if code != 0:
+                    raise RuntimeError(f"7z extraction failed: {tail[-1200:]}")
+            if not ZIP_PATH.exists():
+                raise RuntimeError(
+                    f"extraction finished but {ZIP_PATH.name} was not found"
+                )
+
+        if _lookup_ready():
+            state, pid = _start_api()
+            await edit_safe(
+                status,
+                f"✅ Everything already built. API {state} PID={pid}.\n"
+                "Use /lookup <number>."
+            )
+            return
+
+        state, pid = _start_import()
+        _ensure_pipeline_monitor()
+        await edit_safe(
+            status,
+            f"✅ Source ZIP ready: {human_size(ZIP_PATH.stat().st_size)}\n"
+            f"🔄 Import {state} PID={pid}. It runs in background even if RDP disconnects.\n"
+            "Indexes will be built automatically. API will auto-start when ready.\n"
+            "Use /workflow or /import_status anytime."
+        )
+    except Exception as e:
+        log.exception("buildall failed")
+        await edit_safe(
+            status,
+            f"❌ Build-all failed: {type(e).__name__}: {e}\n"
+            "Use /workflow and /logs import 30."
+        )
+
+
+# ---------------- API key management + direct lookup ----------------
+# ---------------- API key management + direct lookup ----------------
+
+def _args(message: Message):
+    command = message.command or []
+    return command[1:]
+
+
+def _lookup_conn():
+    if not LOOKUP_DB.exists():
+        raise FileNotFoundError(f"Lookup DB not ready: {LOOKUP_DB}")
+    con = sqlite3.connect(f"file:{LOOKUP_DB}?mode=ro", uri=True, timeout=15)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA query_only=ON")
+    return con
+
+
+def _normalize_number(raw: str):
+    s = re.sub(r"\D+", "", raw or "")
+    if not (7 <= len(s) <= 15):
+        raise ValueError("number must contain 7-15 digits")
+    return s
+
+
+def _fmt_record(row):
+    d = dict(row)
+    return (
+        f"_id: {d.get('mongo_oid') or '-'}\n"
+        f"Mobile: {d.get('mobile') or '-'}\n"
+        f"Name: {d.get('name') or '-'}\n"
+        f"Father: {d.get('fname') or '-'}\n"
+        f"Address: {d.get('address') or '-'}\n"
+        f"Alt: {d.get('alt') or '-'}\n"
+        f"Circle: {d.get('circle') or '-'}\n"
+        f"ID: {d.get('ext_id') or '-'}\n"
+        f"Email: {d.get('email') or '-'}"
+    )
+
+
+@app.on_message(filters.command("genkey"))
+@admin_only
+async def genkey_handler(client: Client, message: Message):
+    args = _args(message)
+    if not args:
+        return await message.reply_text("Use: /genkey <name> [days|never]")
+    days = None
+    if len(args) >= 2 and (args[-1].lower() == "never" or args[-1].isdigit()):
+        last = args.pop()
+        if last.lower() != "never":
+            days = max(1, min(3650, int(last)))
+    name = " ".join(args).strip()
+    if not name:
+        return await message.reply_text("Key name required.")
+    data = key_store.generate_key(KEYS_DB, name, message.from_user.id, days)
+    await message.reply_text(
+        "✅ API key generated\n\n"
+        f"ID: {data['id']}\nName: {data['name']}\n"
+        f"Expires: {data['expires_at'] or 'Never'}\n"
+        f"Key: {data['key']}\n\nSave it now. Raw key is not stored."
+    )
+
+
+@app.on_message(filters.command("keys"))
+@admin_only
+async def keys_handler(client: Client, message: Message):
+    rows = key_store.list_keys(KEYS_DB)
+    if not rows:
+        return await message.reply_text("No API keys.")
+    lines = ["🔐 API keys"]
+    for r in rows[:100]:
+        state = "🟢" if r['enabled'] else "🔴"
+        lines.append(f"{state} #{r['id']} {r['name']} | {r['key_prefix']}… | uses={r['use_count']} | exp={r.get('expires_at') or 'Never'}")
+    await message.reply_text("\n".join(lines))
+
+
+@app.on_message(filters.command("key"))
+@admin_only
+async def key_info_handler(client: Client, message: Message):
+    args = _args(message)
+    if not args or not args[0].isdigit():
+        return await message.reply_text("Use: /key <id>")
+    r = key_store.get_key(KEYS_DB, int(args[0]))
+    if not r:
+        return await message.reply_text("Key not found.")
+    await message.reply_text(
+        f"Key #{r['id']}\nName: {r['name']}\nEnabled: {bool(r['enabled'])}\n"
+        f"Prefix: {r['key_prefix']}…\nCreated: {r['created_at']}\n"
+        f"Expires: {r.get('expires_at') or 'Never'}\nLast used: {r.get('last_used_at') or 'Never'}\nUses: {r['use_count']}"
+    )
+
+
+async def _toggle_key(message: Message, enabled: bool):
+    args = _args(message)
+    if not args or not args[0].isdigit():
+        return await message.reply_text(f"Use: /{'enable' if enabled else 'disable'} <id>")
+    ok = key_store.set_enabled(KEYS_DB, int(args[0]), enabled)
+    await message.reply_text("✅ Updated." if ok else "❌ Key not found.")
+
+
+@app.on_message(filters.command("disable"))
+@admin_only
+async def disable_key_handler(client: Client, message: Message):
+    await _toggle_key(message, False)
+
+
+@app.on_message(filters.command("enable"))
+@admin_only
+async def enable_key_handler(client: Client, message: Message):
+    await _toggle_key(message, True)
+
+
+@app.on_message(filters.command("rename"))
+@admin_only
+async def rename_key_handler(client: Client, message: Message):
+    args = _args(message)
+    if len(args) < 2 or not args[0].isdigit():
+        return await message.reply_text("Use: /rename <id> <new name>")
+    ok = key_store.rename_key(KEYS_DB, int(args[0]), " ".join(args[1:]).strip())
+    await message.reply_text("✅ Renamed." if ok else "❌ Key not found.")
+
+
+@app.on_message(filters.command("expire"))
+@admin_only
+async def expire_key_handler(client: Client, message: Message):
+    args = _args(message)
+    if len(args) != 2 or not args[0].isdigit() or not (args[1].isdigit() or args[1].lower() == "never"):
+        return await message.reply_text("Use: /expire <id> <days|never>")
+    days = None if args[1].lower() == "never" else max(1, min(3650, int(args[1])))
+    ok, exp = key_store.set_expiry(KEYS_DB, int(args[0]), days)
+    await message.reply_text(f"✅ Expires: {exp or 'Never'}" if ok else "❌ Key not found.")
+
+
+@app.on_message(filters.command("deletekey"))
+@admin_only
+async def delete_key_handler(client: Client, message: Message):
+    args = _args(message)
+    if len(args) < 2 or not args[0].isdigit() or args[1] != "CONFIRM":
+        return await message.reply_text("Use: /deletekey <id> CONFIRM")
+    ok = key_store.delete_key(KEYS_DB, int(args[0]))
+    await message.reply_text("✅ Key deleted." if ok else "❌ Key not found.")
+
+
+@app.on_message(filters.command("lookup"))
+@admin_only
+async def lookup_handler(client: Client, message: Message):
+    args = _args(message)
+    if not args:
+        return await message.reply_text("Use: /lookup <number>")
+    if not _lookup_ready():
+        return await message.reply_text("⏳ Lookup DB is not ready yet. Use /workflow or /buildall CONFIRM.")
+    try:
+        n = _normalize_number(args[0])
+        with _lookup_conn() as con:
+            rows = con.execute(
+                "SELECT mongo_oid,mobile,name,fname,address,alt,circle,ext_id,email FROM users WHERE mobile=? OR alt=? LIMIT ?",
+                (n, n, MAX_LOOKUP_RESULTS),
+            ).fetchall()
+    except Exception as e:
+        return await message.reply_text(f"❌ Lookup unavailable: {e}")
+    if not rows:
+        return await message.reply_text("No record found.")
+    text = f"Found {len(rows)} record(s) for {n}\n" + "\n\n".join(f"#{i}\n{_fmt_record(r)}" for i, r in enumerate(rows, 1))
+    for pos in range(0, len(text), 3900):
+        await message.reply_text(text[pos:pos+3900])
+
+
+@app.on_message(filters.command("id"))
+@admin_only
+async def id_lookup_handler(client: Client, message: Message):
+    args = _args(message)
+    if not args:
+        return await message.reply_text("Use: /id <record_id>")
+    if not _lookup_ready():
+        return await message.reply_text("⏳ Lookup DB is not ready yet. Use /workflow or /buildall CONFIRM.")
+    try:
+        with _lookup_conn() as con:
+            rows = con.execute(
+                "SELECT mongo_oid,mobile,name,fname,address,alt,circle,ext_id,email FROM users WHERE ext_id=? LIMIT ?",
+                (args[0].strip(), MAX_LOOKUP_RESULTS),
+            ).fetchall()
+    except Exception as e:
+        return await message.reply_text(f"❌ Lookup unavailable: {e}")
+    if not rows:
+        return await message.reply_text("No record found.")
+    text = "\n\n".join(f"#{i}\n{_fmt_record(r)}" for i, r in enumerate(rows, 1))
+    for pos in range(0, len(text), 3900):
+        await message.reply_text(text[pos:pos+3900])
+
+
+@app.on_message(filters.command("stats"))
+@admin_only
+async def stats_handler(client: Client, message: Message):
+    if not LOOKUP_DB.exists():
+        return await message.reply_text(f"Lookup DB not ready: {LOOKUP_DB}")
+    try:
+        with _lookup_conn() as con:
+            rows = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            meta = {r[0]: r[1] for r in con.execute("SELECT key,value FROM import_meta").fetchall()}
+        await message.reply_text(
+            f"Lookup DB: {LOOKUP_DB}\nSize: {human_size(LOOKUP_DB.stat().st_size)}\nRows: {rows:,}\n"
+            f"Import complete: {meta.get('completed','0')}\nProcessed source: {meta.get('processed_records','0')}"
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ Stats error: {e}")
 
 # Document handler comes AFTER command handlers and is private/admin only.
 @app.on_message(filters.document, group=10)
@@ -901,6 +1512,7 @@ async def download_worker():
         current_name = job["file_name"]
         current_started = time.monotonic()
         cancel_current = False
+
         temp = UPLOAD_DIR / (job["file_name"] + ".downloading")
         final = UPLOAD_DIR / job["file_name"]
         status = None
@@ -1047,9 +1659,11 @@ async def download_worker():
             cancel_current = False
 
 
+
 async def bot_main():
-    global worker_task
+    global worker_task, pipeline_task
     init_db()
+    key_store.init_db(KEYS_DB)
     await app.start()
     me = await app.get_me()
     log.info("Started as @%s (id=%s) build=%s", me.username, me.id, BUILD)
@@ -1058,6 +1672,10 @@ async def bot_main():
     log.info("Upload mode starts OFF; parallel streams/file=%s; stream retries=%s", PARALLEL_STREAMS, STREAM_RETRIES)
 
     worker_task = asyncio.create_task(download_worker(), name="download-worker")
+    # Recover monitoring after bot restart while a detached import is still running.
+    import_alive, _ = _proc_status(IMPORT_PID_FILE)
+    if import_alive:
+        _ensure_pipeline_monitor()
     for uid in ADMIN_IDS:
         with suppress(Exception):
             await app.send_message(
@@ -1071,6 +1689,10 @@ async def bot_main():
             worker_task.cancel()
             with suppress(asyncio.CancelledError):
                 await worker_task
+        if pipeline_task and not pipeline_task.done():
+            pipeline_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pipeline_task
         await app.stop()
 
 

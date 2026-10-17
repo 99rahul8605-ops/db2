@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"; mkdir -p logs
-screen -S lookupimport -X quit >/dev/null 2>&1 || true
-screen -L -Logfile "$PWD/logs/import.log" -dmS lookupimport bash -lc "cd '$PWD' && exec ./venv/bin/python3 import_users.py"
-sleep 1; screen -ls | grep lookupimport || true
-echo "Log: $PWD/logs/import.log"
+cd "$(dirname "$0")"
+if screen -list | grep -q "\.lookupimport[[:space:]]"; then
+  echo "lookupimport already running"
+  exit 0
+fi
+screen -dmS lookupimport bash -lc "cd '$PWD' && ./venv/bin/python3 import_users.py 2>&1 | tee -a import.log"
+echo "Import started. Attach: screen -r lookupimport"

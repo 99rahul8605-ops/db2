@@ -1,9 +1,15 @@
 .env
 venv/
-logs/
 __pycache__/
 *.pyc
+*.session
+*.session-journal
 *.db
 *.db-shm
 *.db-wal
-*.session*
+.bot.pid
+.bot.lock
+uploads/
+extracted/
+lookup/
+import.log

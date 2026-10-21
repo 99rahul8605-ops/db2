@@ -20,6 +20,7 @@ from pyrogram.types import Message
 from pyrogram.file_id import FileId
 
 import key_store
+import ops_control as ops
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -128,6 +129,7 @@ current_name = None
 current_started = None
 cancel_current = False
 pipeline_task = None
+index_watch_task = None
 
 
 def _read_pid(path: Path):
@@ -1129,6 +1131,229 @@ async def buildall_handler(client: Client, message: Message):
         )
 
 
+async def _watch_index_completion():
+    """Notify admins when an existing standalone index recovery exits."""
+    seen = bool(ops.matches('recover_indexes_lowram.py'))
+    if not seen:
+        return
+    while ops.matches('recover_indexes_lowram.py'):
+        await asyncio.sleep(20)
+    # Log may be delayed briefly after process exit.
+    await asyncio.sleep(2)
+    if _lookup_ready():
+        await _notify_admins('✅ Index recovery completed. Database ready. /index_status')
+    else:
+        await _notify_admins('⚠️ Index process exited but DB is not ready. /index_logs')
+
+
+def _ensure_index_watch():
+    global index_watch_task
+    if index_watch_task is None or index_watch_task.done():
+        index_watch_task = asyncio.create_task(_watch_index_completion(), name='index-watch')
+
+
+# ---------------- Admin operational control ----------------
+
+@app.on_message(filters.command("control"))
+@admin_only
+async def control_handler(client: Client, message: Message):
+    await message.reply_text(
+        "ADMIN CONTROL PANEL\n"
+        "/workflow /parts /disk /upload_on /upload_off\n"
+        "/test7z /extract7z CONFIRM /buildall CONFIRM\n"
+        "/import_status /index_status /index_start CONFIRM /index_logs\n"
+        "/api_start /api_status /api_restart /api_stop CONFIRM\n"
+        "/tunnel_status /tunnel_start /tunnel_restart /tunnel_stop CONFIRM /tunnel_logs\n"
+        "/server_status /io /bot_logs /api_logs\n"
+        "/cleanup (dry-run only) /cleanup_zip CONFIRM\n"
+        "/genkey /keys /disable /enable /deletekey /lookup /id"
+    )
+
+
+@app.on_message(filters.command("index_status"))
+@admin_only
+async def index_status_handler(client: Client, message: Message):
+    await message.reply_text(await asyncio.to_thread(
+        ops.index_status, LOOKUP_DB, _lookup_meta(), _tail))
+
+
+@app.on_message(filters.command("index_logs"))
+@admin_only
+async def index_logs_handler(client: Client, message: Message):
+    await message.reply_text(_tail(ops.INDEX_LOG, 30, 3500))
+
+
+@app.on_message(filters.command("index_start"))
+@admin_only
+async def index_start_handler(client: Client, message: Message):
+    if _args(message) != ["CONFIRM"]:
+        return await message.reply_text("Use /index_start CONFIRM (only if import completed and indexing failed)")
+    if _lookup_ready():
+        return await message.reply_text("✅ Database already ready. No indexing needed.")
+    import_alive, _ = _proc_status(IMPORT_PID_FILE)
+    if import_alive:
+        return await message.reply_text("⚠️ Import is running. Cannot start parallel recovery.")
+    if not LOOKUP_DB.exists():
+        return await message.reply_text("Database missing; cannot recover indexes.")
+    meta = _lookup_meta()
+    if meta.get('phase') != 'indexing':
+        return await message.reply_text(f"Refusing recovery: database phase={meta.get('phase')!r}, expected 'indexing'.")
+    if ops.matches('recover_indexes_lowram.py'):
+        return await message.reply_text("Index recovery already running.")
+    py = ROOT / 'venv' / 'bin' / 'python3'
+    if not py.exists():
+        return await message.reply_text("Missing venv Python.")
+    try:
+        state, pid = await asyncio.to_thread(ops.start, 'index',
+            [str(py), '-u', str(ROOT/'recover_indexes_lowram.py'), '--run'],
+            ops.INDEX_LOG, 'recover_indexes_lowram.py')
+        _ensure_index_watch()
+        await message.reply_text(f"Index recovery {state}; PID={pid}. Use /index_status.")
+    except Exception as e:
+        await message.reply_text(f"Recovery start failed: {type(e).__name__}: {e}")
+
+
+@app.on_message(filters.command("api_restart"))
+@admin_only
+async def api_restart_handler(client: Client, message: Message):
+    # Only restart an instance that has been started and recorded by this bot.
+    alive, pid = _proc_status(API_PID_FILE)
+    if alive:
+        await asyncio.to_thread(_stop_detached, API_PID_FILE)
+    try:
+        state, pid = await asyncio.to_thread(_start_api)
+        await message.reply_text(f"API {state}, PID={pid}. If another unmanaged API owns port {API_PORT}, see /api_logs.")
+    except Exception as e:
+        await message.reply_text(f"API restart failed: {e}")
+
+
+@app.on_message(filters.command("tunnel_start"))
+@admin_only
+async def tunnel_start_handler(client: Client, message: Message):
+    if not ops.TUNNEL_CONFIG.is_file():
+        return await message.reply_text(f"Tunnel config missing: {ops.TUNNEL_CONFIG}")
+    try:
+        state, pid = await asyncio.to_thread(ops.start, 'tunnel',
+            [ops.CLOUDFLARED, 'tunnel', '--config', str(ops.TUNNEL_CONFIG), 'run'],
+            ROOT/'tunnel.log', str(ops.TUNNEL_CONFIG))
+        await message.reply_text(f"Cloudflare tunnel {state}; PID={pid}. Use /tunnel_logs")
+    except Exception as e:
+        await message.reply_text(f"Tunnel start failed: {e}")
+
+
+@app.on_message(filters.command("tunnel_status"))
+@admin_only
+async def tunnel_status_handler(client: Client, message: Message):
+    pids = ops.matches(str(ops.TUNNEL_CONFIG))
+    await message.reply_text(f"Cloudflare tunnel: {'running' if pids else 'stopped'}\n"
+        f"PIDs: {pids or '-'}\nConfig: {ops.TUNNEL_CONFIG}\n"
+        f"Managed PID: {ops.owned_pid('tunnel') or '-'}\n"
+        f"Latest log:\n{_tail(ROOT/'tunnel.log', 8, 1100)}")
+
+
+@app.on_message(filters.command("tunnel_stop"))
+@admin_only
+async def tunnel_stop_handler(client: Client, message: Message):
+    if _args(message) != ['CONFIRM']:
+        return await message.reply_text('Use /tunnel_stop CONFIRM')
+    try:
+        pid = await asyncio.to_thread(ops.stop, 'tunnel')
+        await message.reply_text(f"Stopped managed tunnel PID={pid}.")
+    except Exception as e:
+        await message.reply_text(str(e) + '\nExternal screen tunnel must be stopped outside the bot once to migrate control.')
+
+
+@app.on_message(filters.command("tunnel_restart"))
+@admin_only
+async def tunnel_restart_handler(client: Client, message: Message):
+    pid = ops.owned_pid('tunnel')
+    if pid:
+        await asyncio.to_thread(ops.stop, 'tunnel')
+    elif ops.matches(str(ops.TUNNEL_CONFIG)):
+        return await message.reply_text('Tunnel was started outside bot; refusing to kill it. /tunnel_status')
+    await tunnel_start_handler.__wrapped__(client, message)
+
+
+@app.on_message(filters.command('tunnel_logs'))
+@admin_only
+async def tunnel_logs_handler(client: Client, message: Message):
+    await message.reply_text(_tail(ROOT/'tunnel.log', 25, 3500) + '\n\nExternal screen log: ' + _tail(Path('/root/db2-tunnel.log'), 12, 1300))
+
+
+@app.on_message(filters.command(['server_status', 'ram']))
+@admin_only
+async def server_status_handler(client: Client, message: Message):
+    disk = shutil.disk_usage(ROOT)
+    with open('/proc/meminfo') as f:
+        mem = {k: int(v.split()[0])*1024 for k, v in (line.split(':',1) for line in f)}
+    limit = Path('/sys/fs/cgroup/memory.max')
+    cap = limit.read_text().strip() if limit.exists() else 'unknown'
+    await message.reply_text(
+        f"Disk: total {human_size(disk.total)} / free {human_size(disk.free)}\n"
+        f"Host RAM available: {human_size(mem.get('MemAvailable', 0))}\n"
+        f"Container RAM cap: {human_size(int(cap)) if cap.isdigit() else cap}\n"
+        f"DB size: {human_size(LOOKUP_DB.stat().st_size) if LOOKUP_DB.exists() else 'missing'}\n"
+        f"API PID: {_proc_status(API_PID_FILE)[1] or 'unmanaged/stopped'}\n"
+        f"Tunnel PIDs: {ops.matches(str(ops.TUNNEL_CONFIG)) or '-'}")
+
+
+@app.on_message(filters.command('io'))
+@admin_only
+async def io_handler(client: Client, message: Message):
+    pids = ops.matches('recover_indexes_lowram.py') or ops.matches('import_users.py')
+    if not pids:
+        return await message.reply_text('No active importer/indexer process found.')
+    pid = pids[0]
+    try:
+        a = await asyncio.to_thread(ops.process_io, pid)
+        await asyncio.sleep(2)
+        b = await asyncio.to_thread(ops.process_io, pid)
+        await message.reply_text(f"PID {pid} disk I/O\n"
+            f"Read {(b['read_bytes']-a['read_bytes'])/2/1048576:.1f} MiB/s\n"
+            f"Write {(b['write_bytes']-a['write_bytes'])/2/1048576:.1f} MiB/s")
+    except Exception as e:
+        await message.reply_text(f"I/O unavailable: {e}")
+
+
+@app.on_message(filters.command('bot_logs'))
+@admin_only
+async def bot_logs_handler(client: Client, message: Message):
+    await message.reply_text(_tail(ROOT/'bot.log', 25, 3500))
+
+
+@app.on_message(filters.command('api_logs'))
+@admin_only
+async def api_logs_handler(client: Client, message: Message):
+    await message.reply_text(_tail(API_LOG, 25, 3500) + '\n\nExternal log:\n' + _tail(Path('/root/api.log'), 12, 1100))
+
+
+@app.on_message(filters.command('cleanup'))
+@admin_only
+async def cleanup_handler(client: Client, message: Message):
+    if ZIP_PATH.exists():
+        await message.reply_text(f"Cleanup dry run only. ZIP: {ZIP_PATH} ({human_size(ZIP_PATH.stat().st_size)})\n"
+            "Only use /cleanup_zip CONFIRM if backup has been verified on another disk.")
+    else:
+        await message.reply_text('Source ZIP already absent. Database is NOT a cleanup target.')
+
+
+@app.on_message(filters.command('cleanup_zip'))
+@admin_only
+async def cleanup_zip_handler(client: Client, message: Message):
+    if _args(message) != ['CONFIRM']:
+        return await message.reply_text('Use /cleanup_zip CONFIRM after verifying remote backup.')
+    if not _lookup_ready():
+        return await message.reply_text('Refused: database is not marked ready.')
+    if _proc_status(IMPORT_PID_FILE)[0] or ops.matches('recover_indexes_lowram.py'):
+        return await message.reply_text('Refused: import/index process still running.')
+    if ZIP_PATH.exists():
+        size = ZIP_PATH.stat().st_size
+        ZIP_PATH.unlink()
+        await message.reply_text(f'Deleted only source ZIP ({human_size(size)}). SQLite DB untouched.')
+    else:
+        await message.reply_text('ZIP already absent.')
+
+
 # ---------------- API key management + direct lookup ----------------
 # ---------------- API key management + direct lookup ----------------
 
@@ -1789,7 +2014,7 @@ async def download_worker():
 
 
 async def bot_main():
-    global worker_task, pipeline_task
+    global worker_task, pipeline_task, index_watch_task
     init_db()
     key_store.init_db(KEYS_DB)
     await app.start()
@@ -1804,6 +2029,8 @@ async def bot_main():
     import_alive, _ = _proc_status(IMPORT_PID_FILE)
     if import_alive:
         _ensure_pipeline_monitor()
+    if ops.matches('recover_indexes_lowram.py'):
+        _ensure_index_watch()
     for uid in ADMIN_IDS:
         with suppress(Exception):
             await app.send_message(
@@ -1821,6 +2048,10 @@ async def bot_main():
             pipeline_task.cancel()
             with suppress(asyncio.CancelledError):
                 await pipeline_task
+        if index_watch_task and not index_watch_task.done():
+            index_watch_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await index_watch_task
         await app.stop()
 
 

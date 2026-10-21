@@ -66,7 +66,7 @@ case "$ACTION" in
   follow) touch "$LOG"; tail -f "$LOG" ;;
   stop)
     if has_screen; then screen -S "$SESSION" -X quit; echo 'Stopped bot screen.'; else echo 'Bot screen not running.'; fi ;;
-  restart) "$0" stop; "$0" start ;;
+  restart) bash "$ROOT/run.sh" stop; bash "$ROOT/run.sh" start ;;
   tidy)
     echo '[tidy] Moving legacy .sh files out of project root (not deleting).'
     backup="$ROOT/.legacy-shell-backup/$(date +%Y%m%d-%H%M%S)"

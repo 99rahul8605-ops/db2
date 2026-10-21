@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import re
 import sqlite3
 import time
@@ -69,7 +70,32 @@ def insert_batch(c, batch):
     )
 
 
+def run_lowram_indexes():
+    """Replace importer with isolated low-RAM index builder; never rebuild imported rows."""
+    script = ROOT / "recover_indexes_lowram.py"
+    if not script.is_file():
+        raise RuntimeError(f"Missing low-RAM index builder: {script}")
+    print("Starting low-RAM index recovery (indexes only; no re-import)...", flush=True)
+    os.execv(sys.executable, [sys.executable, "-u", str(script), "--db", str(LOOKUP_DB), "--run"])
+
+
 def main():
+    # After an interruption, resume index-only phase without needing source ZIP.
+    if LOOKUP_DB.is_file():
+        existing = sqlite3.connect(f"file:{LOOKUP_DB}?mode=ro", uri=True, timeout=10)
+        try:
+            phase_row = existing.execute("SELECT value FROM import_meta WHERE key='phase'").fetchone()
+            phase = phase_row[0] if phase_row else None
+            ready_row = existing.execute("SELECT value FROM import_meta WHERE key='completed'").fetchone()
+            completed = ready_row[0] if ready_row else None
+        finally:
+            existing.close()
+        if phase == 'ready' and completed == '1':
+            print("Import + indexes already complete.", flush=True)
+            return
+        if phase == 'indexing':
+            run_lowram_indexes()
+
     if not ZIP_PATH.exists():
         raise SystemExit(f"ZIP not found: {ZIP_PATH}")
     LOOKUP_DB.parent.mkdir(parents=True, exist_ok=True)
@@ -142,19 +168,10 @@ def main():
     setmeta(c, "updated_at", int(time.time()))
     c.commit()
 
-    print("Building indexes...", flush=True)
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_mobile ON users(mobile)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_alt ON users(alt)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_extid ON users(ext_id)")
-    c.execute("ANALYZE")
-    setmeta(c, "phase", "ready")
-    setmeta(c, "completed", "1")
-    setmeta(c, "updated_at", int(time.time()))
-    c.commit()
-    print(f"Done. inserted_total={inserted_total+inserted_run:,}", flush=True)
+    print("Import checkpoint saved. Switching to low-RAM indexing...", flush=True)
     c.close()
+    # execv changes the program within the same PID, so bot supervision persists.
+    run_lowram_indexes()
 
 
 if __name__ == "__main__":

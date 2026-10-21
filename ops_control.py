@@ -1,11 +1,15 @@
 """Constrained local process management. No arbitrary shell commands from Telegram."""
 import os
+from contextlib import closing
 import signal
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
+from dotenv import load_dotenv
 
 BASE = Path(__file__).resolve().parent
+load_dotenv(BASE / '.env')
 RUNTIME = BASE / 'ops_runtime'
 RUNTIME.mkdir(exist_ok=True)
 INDEX_LOG = Path(os.environ.get('INDEX_RECOVERY_LOG', '/root/index_recovery.log'))
@@ -40,18 +44,30 @@ def owned_pid(name):
 
 
 def matches(marker):
+    """Return actual worker PIDs, not parent screen/bash wrappers."""
     output = []
     for directory in Path('/proc').iterdir():
         if not directory.name.isdigit():
             continue
         try:
             pid = int(directory.name)
-            cmd = (directory / 'cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')
-            if marker in cmd and _alive(pid):
+            argv = [x.decode(errors='replace') for x in (directory / 'cmdline').read_bytes().split(b'\0') if x]
+            if not argv or not _alive(pid):
+                continue
+            executable = Path(argv[0]).name.lower()
+            if marker.endswith('.py') and not executable.startswith('python'):
+                continue
+            if marker == str(TUNNEL_CONFIG) and not executable.startswith('cloudflared'):
+                continue
+            if marker.endswith('.py'):
+                found = any(Path(a).name == Path(marker).name for a in argv[1:])
+            else:
+                found = marker in argv[1:]
+            if found:
                 output.append(pid)
         except (OSError, ValueError):
             pass
-    return output
+    return sorted(output)
 
 
 def start(name, command, log_path, marker):
@@ -80,13 +96,39 @@ def stop(name):
     return pid
 
 
-def index_status(db, meta, log_tail):
-    log = log_tail(INDEX_LOG, 20, 2800)
-    done = [n for n in ('idx_users_mobile', 'idx_users_alt', 'idx_users_extid') if f'DONE {n}' in log or (INDEX_LOG.exists() and f'DONE {n}' in INDEX_LOG.read_text(errors='replace'))]
+def index_status(db, import_log, log_tail):
+    names = ('idx_users_mobile', 'idx_users_alt', 'idx_users_extid')
+    present = None
+    ready = 'unavailable (database locked or missing)'
+    problem = None
+    if db.is_file():
+        try:
+            with closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True, timeout=0.5)) as con:
+                present = {row[0] for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='users'")}
+                meta = dict(con.execute('SELECT key,value FROM import_meta').fetchall())
+                ready = str(meta.get('phase') == 'ready' and meta.get('completed') == '1')
+        except sqlite3.Error as e:
+            problem = str(e)
+    else:
+        problem = 'database file missing'
     pids = matches('recover_indexes_lowram.py')
-    return (f'Indexes completed in log: {len(done)}/3\n'
-            f'PID: {pids[0] if pids else "not running"}\n'
-            f'Database ready: {meta.get("completed") == "1" and meta.get("phase") == "ready"}\n\n{log}')
+    # Prefer fresh log, but database metadata is the authority for DONE statuses.
+    files = [file for file in (INDEX_LOG, import_log) if file.is_file()]
+    latest = max(files, key=lambda file: file.stat().st_mtime) if files else None
+    out = ['📊 Index recovery',
+           f'Python PID: {pids[0] if pids else "not running"}',
+           f'Database ready: {ready}']
+    if present is None:
+        out.append('Index counts: currently unavailable (no reliable percentage while DB locked)')
+        if problem:
+            out.append(f'SQLite: {problem[:160]}')
+    else:
+        out.append(f'Completed: {sum(n in present for n in names)}/3')
+        out.extend(f'{"✅ DONE" if n in present else "⏳ PENDING"} {n}' for n in names)
+    if latest:
+        out.append(f'\nLatest log: {latest}\n{log_tail(latest, 14, 1900)}')
+    return '\n'.join(out)[:3800]
 
 
 def process_io(pid):

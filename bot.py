@@ -9,9 +9,12 @@ import time
 import subprocess
 import signal
 import urllib.request
+import json
+import socket
 from contextlib import suppress
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle, enums
@@ -30,7 +33,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("hitek-unified-manager")
-BUILD = "hitek-bot-public-ip-port-2026-10-17-3"
+BUILD = "db2-onebot-lowram-autorecovery-public-url-2026-10-22"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
@@ -60,7 +63,9 @@ ZIP_PATH = Path(os.getenv("ZIP_PATH", str(EXTRACT_DIR / "users_data.zip"))).reso
 API_HOST = os.getenv("API_HOST", "127.0.0.1").strip() or "127.0.0.1"
 API_PORT = int(os.getenv("API_PORT", "8080") or 8080)
 PUBLIC_HOST = os.getenv("PUBLIC_HOST", "").strip()
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "").strip().rstrip("/")
 RATE_LIMIT_PER_MIN = max(1, min(10000, int(os.getenv("RATE_LIMIT_PER_MIN", "60") or 60)))
+SEVEN_ZIP = shutil.which("7z") or shutil.which("7zz") or "7z"
 _INSTANCE_LOCK_FH = None
 
 if not BOT_TOKEN:
@@ -140,23 +145,30 @@ def _read_pid(path: Path):
 
 
 def _pid_alive(pid):
+    """A zombie PID is dead; os.kill(pid, 0) alone cannot detect that."""
     if not pid:
         return False
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
+        status = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return status.rsplit(") ", 1)[1].split()[0] not in {"Z", "X"}
+    except (FileNotFoundError, ProcessLookupError):
         return False
     except PermissionError:
         return True
-    except Exception:
+    except (OSError, IndexError):
         return False
 
 
 def _proc_status(pid_file: Path):
     pid = _read_pid(pid_file)
     if pid and _pid_alive(pid):
-        return True, pid
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            expected = ("import_users.py", "recover_indexes_lowram.py") if pid_file == IMPORT_PID_FILE else ("uvicorn", "api:app")
+            if any(part in cmd for part in expected):
+                return True, pid
+        except OSError:
+            pass
     if pid_file.exists():
         with suppress(Exception):
             pid_file.unlink()
@@ -180,6 +192,11 @@ def _start_detached(cmd, pid_file: Path, log_file: Path):
     )
     log_fh.close()
     pid_file.write_text(str(proc.pid), encoding="utf-8")
+    # Surface broken commands early rather than reporting a successful start.
+    time.sleep(0.25)
+    if proc.poll() is not None:
+        pid_file.unlink(missing_ok=True)
+        raise RuntimeError(f"Process exited with code {proc.returncode}. Check {log_file}.")
     return True, proc.pid
 
 
@@ -242,29 +259,79 @@ def _lookup_ready():
     return LOOKUP_DB.exists() and meta.get("completed") == "1" and meta.get("phase") in {None, "ready"}
 
 
+def _start_index_recovery():
+    """Use only the committed SQLite checkpoint; never re-import the JSON."""
+    py = ROOT / "venv" / "bin" / "python3"
+    if not py.is_file():
+        raise RuntimeError("venv Python missing; run bash run.sh setup")
+    if not (ROOT / "recover_indexes_lowram.py").is_file():
+        raise RuntimeError("recover_indexes_lowram.py is missing")
+    meta = _lookup_meta()
+    if meta.get("phase") != "indexing":
+        raise RuntimeError(f"Refusing index-only recovery: phase={meta.get('phase')!r}")
+    if not LOOKUP_DB.is_file():
+        raise RuntimeError("Database file missing")
+    import_alive, import_pid = _proc_status(IMPORT_PID_FILE)
+    if import_alive:
+        return "import/index already running", import_pid
+    existing = ops.matches("recover_indexes_lowram.py")
+    if existing:
+        return "index recovery already running", existing[0]
+    # This log is separate from import.log so /index_status always finds it.
+    return ops.start("index", [str(py), "-u", str(ROOT / "recover_indexes_lowram.py"),
+                               "--db", str(LOOKUP_DB), "--run"],
+                     ops.INDEX_LOG, "recover_indexes_lowram.py")
+
+
 def _start_import():
     meta = _lookup_meta()
-    if meta.get("completed") == "1" and meta.get("phase") in {None, "ready"}:
+    if meta.get("completed") == "1" and meta.get("phase") == "ready":
         return "complete", None
+    # Critical: a finished import with missing indexes must never rescan 446 GiB JSON.
+    if meta.get("phase") == "indexing":
+        return _start_index_recovery()
     python = ROOT / "venv" / "bin" / "python3"
-    if not python.exists():
+    if not python.is_file():
         raise RuntimeError("venv missing; run bash run.sh setup once")
-    if not ZIP_PATH.exists():
+    other = ops.matches("recover_indexes_lowram.py")
+    if other:
+        return "index recovery already running", other[0]
+    if not ZIP_PATH.is_file():
         raise RuntimeError(f"Source ZIP not found: {ZIP_PATH}")
     started, pid = _start_detached([python, ROOT / "import_users.py"], IMPORT_PID_FILE, IMPORT_LOG)
     return ("started" if started else "running"), pid
 
 
+def _api_health_ok():
+    """Check a pre-existing manually started local API without trusting a stale PID."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{API_PORT}/health", timeout=1.5) as response:
+            data = json.loads(response.read(512))
+        return response.status == 200 and data.get("ok") is True
+    except Exception:
+        return False
+
+
 def _start_api():
     if not _lookup_ready():
         raise RuntimeError("Lookup DB is not fully imported/indexed yet")
+    alive, pid = _proc_status(API_PID_FILE)
+    if alive:
+        return "already running (managed)", pid
+    if _api_health_ok():
+        # Do not start a duplicate process against an external screen-managed API.
+        return "already running (external; not managed by bot)", None
+    try:
+        with socket.create_connection(("127.0.0.1", API_PORT), timeout=0.5):
+            raise RuntimeError(f"TCP port {API_PORT} already in use by another service")
+    except (ConnectionRefusedError, TimeoutError, OSError):
+        pass
     uvicorn = ROOT / "venv" / "bin" / "uvicorn"
-    if not uvicorn.exists():
+    if not uvicorn.is_file():
         raise RuntimeError("uvicorn missing; run bash run.sh setup once")
     started, pid = _start_detached(
         [uvicorn, "api:app", "--host", API_HOST, "--port", str(API_PORT), "--workers", "1"],
-        API_PID_FILE,
-        API_LOG,
+        API_PID_FILE, API_LOG,
     )
     return ("started" if started else "running"), pid
 
@@ -308,22 +375,25 @@ def _public_ip():
 
 
 def _public_url():
-    ip = _public_ip()
-    return f"http://{ip}:{API_PORT}" if ip else None
+    # A Cloudflare hostname is preferred: host/container public IP often uses NAT.
+    if PUBLIC_API_URL.startswith("https://"):
+        return PUBLIC_API_URL
+    if API_HOST == "0.0.0.0":
+        ip = _public_ip()
+        return f"http://{ip}:{API_PORT}" if ip else None
+    return None
 
 
 def _api_urls_text():
     public = _public_url()
     bind = f"http://{API_HOST}:{API_PORT}"
-    local = f"http://127.0.0.1:{API_PORT}"
-    lines = [
-        f"Bind: {bind}",
-        f"Local: {local}",
-    ]
-    if API_HOST == "0.0.0.0":
-        lines.append(f"Public: {public or 'public IP detection failed'}")
+    lines = [f"Bind: {bind}", f"Local: http://127.0.0.1:{API_PORT}"]
+    if PUBLIC_API_URL.startswith("https://"):
+        lines.append(f"Cloudflare URL: {PUBLIC_API_URL} (requires active tunnel)")
+    elif API_HOST == "0.0.0.0":
+        lines.append(f"Direct IP: {public or 'unknown'} (requires provider port forwarding)")
     else:
-        lines.append("Public: OFF (localhost-only)")
+        lines.append("Direct public IP: OFF (localhost-only)")
     lines.append(f"Per-key rate limit: {RATE_LIMIT_PER_MIN}/minute")
     return "\n".join(lines)
 
@@ -355,7 +425,8 @@ def _workflow_text():
         f"Processed: {processed}\n"
         f"Inserted: {inserted}\n"
         f"Rate: {rate} rec/s\n"
-        f"Importer: {'🟢 PID '+str(import_pid) if import_alive else '⚪ stopped'}\n"
+        f"Import/index worker: {'🟢 PID '+str(import_pid) if import_alive else '⚪ stopped'}\n"
+        f"Index recovery PIDs: {ops.matches('recover_indexes_lowram.py') or '-'}\n"
         f"API: {'🟢 PID '+str(api_pid) if api_alive else '⚪ stopped'}\n"
         f"API bind: http://{API_HOST}:{API_PORT}\n"
         f"Public URL: {_public_url() or '-'}"
@@ -369,40 +440,55 @@ async def _notify_admins(text: str):
 
 
 async def _pipeline_monitor():
-    """Recoverable monitor: wait for importer, then start API when indexes are ready."""
-    last_notice = 0.0
+    """Watch detached import/index; resume interrupted index stage at most once."""
+    last_notice = time.monotonic()
+    recovery_attempts = 0
     while True:
-        meta = _lookup_meta()
-        if meta.get("completed") == "1" and meta.get("phase") in {None, "ready"}:
+        meta = await asyncio.to_thread(_lookup_meta)
+        if meta.get("completed") == "1" and meta.get("phase") == "ready":
             try:
-                state, pid = _start_api()
+                state, pid = await asyncio.to_thread(_start_api)
                 await _notify_admins(
-                    f"✅ Lookup DB import + indexes complete.\nAPI {state} (PID {pid}).\n"
-                    f"Use /lookup <number>, /genkey, /workflow"
+                    f"✅ Lookup DB import + all indexes complete.\nAPI {state} (PID {pid}).\n"
+                    "Use /index_status or /workflow"
                 )
             except Exception as e:
                 await _notify_admins(f"⚠️ DB ready but API start failed: {type(e).__name__}: {e}")
             return
 
-        alive, pid = _proc_status(IMPORT_PID_FILE)
-        if not alive:
-            # Import can exit just before final metadata becomes visible; check once more.
+        import_alive, _ = _proc_status(IMPORT_PID_FILE)
+        other_recovery = ops.matches("recover_indexes_lowram.py")
+        if not import_alive and not other_recovery:
+            # SQLite may still be releasing locks on exit.
             await asyncio.sleep(2)
-            meta = _lookup_meta()
-            if meta.get("completed") == "1" and meta.get("phase") in {None, "ready"}:
+            meta = await asyncio.to_thread(_lookup_meta)
+            if meta.get("completed") == "1" and meta.get("phase") == "ready":
                 continue
+            if meta.get("phase") == "indexing" and recovery_attempts < 1:
+                recovery_attempts += 1
+                try:
+                    state, pid = await asyncio.to_thread(_start_index_recovery)
+                    await _notify_admins(
+                        f"⚠️ Import/index worker exited in indexing phase.\n"
+                        f"✅ Low-RAM index-only recovery {state} (PID {pid}).\n"
+                        "No JSON re-import. Use /index_status and /index_logs."
+                    )
+                    continue
+                except Exception as e:
+                    await _notify_admins(f"❌ Automatic index recovery failed: {type(e).__name__}: {e}")
             await _notify_admins(
-                "❌ Lookup importer stopped before completion.\n"
-                f"{_workflow_text()}\n\nLast import log:\n{_tail(IMPORT_LOG, 15, 2500)}\n"
-                "Use /import_start to resume."
+                "❌ Import/index worker stopped before DB was ready.\n"
+                f"{_workflow_text()}\n\nImport log:\n{_tail(IMPORT_LOG, 12, 1800)}\n"
+                f"Index log:\n{_tail(ops.INDEX_LOG, 8, 1100)}\n"
+                "Use /index_status; recovery can be restarted with /index_start CONFIRM."
             )
             return
 
         now = time.monotonic()
-        if now - last_notice >= 1800:  # at most every 30 minutes
+        if now - last_notice >= 1800:
             await _notify_admins(_workflow_text())
             last_notice = now
-        await asyncio.sleep(30)
+        await asyncio.sleep(20)
 
 
 def _ensure_pipeline_monitor():
@@ -668,6 +754,7 @@ async def start_handler(client: Client, message: Message):
         "/import_start • /import_status • /import_stop CONFIRM\n"
         "/api_start • /api_status • /api_stop CONFIRM\n"
         "/public_on CONFIRM • /public_off CONFIRM • /public_url\n"
+        "/set_public_url https://your.domain\n"
         "/logs import [lines] • /logs api [lines]\n\n"
         "API KEYS\n"
         "/genkey <name> [days|never] • /keys • /key <id>\n"
@@ -829,7 +916,7 @@ async def disk_handler(client: Client, message: Message):
 async def _test_archive():
     _, items = choose_group(True)
     first = items[0][1]
-    code, out = await run_cmd(["7z", "t", str(first)])
+    code, out = await run_cmd([SEVEN_ZIP, "t", str(first)])
     return code, out, first
 
 
@@ -837,7 +924,7 @@ async def _extract_archive(status: Message | None = None):
     _, items = choose_group(True)
     first = items[0][1]
     proc = await asyncio.create_subprocess_exec(
-        "7z", "x", str(first), f"-o{EXTRACT_DIR}", "-y", "-bb1", "-bsp1",
+        SEVEN_ZIP, "x", str(first), f"-o{EXTRACT_DIR}", "-y", "-bb1", "-bsp1",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
@@ -885,7 +972,7 @@ async def test7z_handler(client: Client, message: Message):
 async def info7z_handler(client: Client, message: Message):
     _, items = choose_group(True)
     first = items[0][1]
-    code, out = await run_cmd(["7z", "l", "-slt", str(first)])
+    code, out = await run_cmd([SEVEN_ZIP, "l", "-slt", str(first)])
     await message.reply_text(f"exit={code}\n{out[-3500:]}")
 
 
@@ -921,7 +1008,7 @@ async def workflow_handler(client: Client, message: Message):
 @admin_only
 async def import_start_handler(client: Client, message: Message):
     try:
-        state, pid = _start_import()
+        state, pid = await asyncio.to_thread(_start_import)
         if state == "complete":
             await message.reply_text(
                 "✅ Import + indexes already complete. Use /api_start or /buildall CONFIRM."
@@ -950,7 +1037,11 @@ async def import_status_handler(client: Client, message: Message):
 async def import_stop_handler(client: Client, message: Message):
     if len(message.command or []) < 2 or message.command[1] != "CONFIRM":
         return await message.reply_text("Use: /import_stop CONFIRM")
+    global pipeline_task
     stopped, pid = await asyncio.to_thread(_stop_detached, IMPORT_PID_FILE)
+    if pipeline_task and not pipeline_task.done():
+        pipeline_task.cancel()
+        pipeline_task = None
     await message.reply_text(
         ("✅ Import stopped" if stopped else "ℹ️ Import not running")
         + (f" (PID {pid})" if pid else "")
@@ -975,7 +1066,7 @@ async def api_start_handler(client: Client, message: Message):
 async def api_status_handler(client: Client, message: Message):
     alive, pid = _proc_status(API_PID_FILE)
     await message.reply_text(
-        ("API: 🟢 running" if alive else "API: ⚪ stopped")
+        ("API: 🟢 managed running" if alive else "API: 🟢 external running" if await asyncio.to_thread(_api_health_ok) else "API: ⚪ stopped")
         + (f" PID={pid}" if pid else "")
         + "\n" + _api_urls_text()
         + f"\nLookup ready: {_lookup_ready()}"
@@ -1004,6 +1095,51 @@ async def public_url_handler(client: Client, message: Message):
         "🌐 API network\n"
         + _api_urls_text()
         + "\n\nRemote request requires a valid X-API-Key."
+    )
+
+
+@app.on_message(filters.command("set_public_url"))
+@admin_only
+async def set_public_url_handler(client: Client, message: Message):
+    """Update the displayed HTTPS public hostname without restarting API/tunnel."""
+    global PUBLIC_API_URL
+    args = message.command or []
+    if len(args) != 2:
+        return await message.reply_text(
+            "Use: /set_public_url https://dbapi.teamsecret.in\n"
+            "This only changes the bot's displayed URL, not DNS or tunnel routing."
+        )
+    value = args[1].strip().rstrip("/")
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        labels = host.split(".")
+        valid_host = (
+            1 < len(labels) and len(host) <= 253 and
+            all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                for label in labels)
+        )
+        valid = (
+            parsed.scheme == "https" and parsed.netloc.lower() == host.lower() and
+            not parsed.path and not parsed.query and not parsed.fragment and
+            valid_host
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        return await message.reply_text(
+            "Invalid URL. Send a plain HTTPS hostname, for example:\n"
+            "/set_public_url https://dbapi.teamsecret.in"
+        )
+    try:
+        await asyncio.to_thread(_set_env_value, "PUBLIC_API_URL", value)
+    except OSError as exc:
+        return await message.reply_text(f"Could not save public URL: {exc}")
+    PUBLIC_API_URL = value
+    await message.reply_text(
+        f"✅ Public API URL updated: {PUBLIC_API_URL}\n"
+        "Updated immediately and saved in .env for next bot restart.\n"
+        "Cloudflare Tunnel/DNS must be running separately."
     )
 
 
@@ -1082,7 +1218,17 @@ async def buildall_handler(client: Client, message: Message):
         "🚀 Build-all started. Upload mode turned OFF. Checking current state..."
     )
     try:
-        if not ZIP_PATH.exists():
+        # Check completed DB first: source archive may already be deleted.
+        if _lookup_ready():
+            state, pid = _start_api()
+            await edit_safe(status, f"✅ Database ready. API {state} PID={pid}.")
+            return
+        # Existing import checkpoint in indexing phase must be recovered,
+        # never re-extracted/re-imported simply because the ZIP is missing.
+        index_resume = _lookup_meta().get("phase") == "indexing" and LOOKUP_DB.exists()
+        if LOOKUP_DB.exists() and ops.matches('recover_indexes_lowram.py'):
+            index_resume = True
+        if not ZIP_PATH.exists() and not index_resume:
             if operation_lock.locked():
                 raise RuntimeError("archive operation already running")
             await edit_safe(status, "🧪 Source ZIP missing. Testing split archive first...")
@@ -1113,13 +1259,13 @@ async def buildall_handler(client: Client, message: Message):
             )
             return
 
-        state, pid = _start_import()
+        state, pid = await asyncio.to_thread(_start_import)
         _ensure_pipeline_monitor()
         await edit_safe(
             status,
-            f"✅ Source ZIP ready: {human_size(ZIP_PATH.stat().st_size)}\n"
-            f"🔄 Import {state} PID={pid}. It runs in background even if RDP disconnects.\n"
-            "Indexes will be built automatically. API will auto-start when ready.\n"
+            f"✅ {'Existing DB indexing checkpoint' if index_resume else 'Source ZIP ready: ' + human_size(ZIP_PATH.stat().st_size)}\n"
+            f"🔄 Import/index recovery {state} PID={pid}. It runs in background even if RDP disconnects.\n"
+            "Indexes use low-RAM mode automatically. API will auto-start when ready.\n"
             "Use /workflow or /import_status anytime."
         )
     except Exception as e:
@@ -1163,6 +1309,7 @@ async def control_handler(client: Client, message: Message):
         "/test7z /extract7z CONFIRM /buildall CONFIRM\n"
         "/import_status /index_status /index_start CONFIRM /index_logs\n"
         "/api_start /api_status /api_restart /api_stop CONFIRM\n"
+        "/public_url /set_public_url https://your.domain\n"
         "/tunnel_status /tunnel_start /tunnel_restart /tunnel_stop CONFIRM /tunnel_logs\n"
         "/server_status /io /bot_logs /api_logs\n"
         "/cleanup (dry-run only) /cleanup_zip CONFIRM\n"
@@ -1174,13 +1321,15 @@ async def control_handler(client: Client, message: Message):
 @admin_only
 async def index_status_handler(client: Client, message: Message):
     await message.reply_text(await asyncio.to_thread(
-        ops.index_status, LOOKUP_DB, _lookup_meta(), _tail))
+        ops.index_status, LOOKUP_DB, IMPORT_LOG, _tail))
 
 
 @app.on_message(filters.command("index_logs"))
 @admin_only
 async def index_logs_handler(client: Client, message: Message):
-    await message.reply_text(_tail(ops.INDEX_LOG, 30, 3500))
+    await message.reply_text(
+        "Index recovery log:\n" + _tail(ops.INDEX_LOG, 18, 1800)
+        + "\n\nImport handoff log:\n" + _tail(IMPORT_LOG, 12, 1500))
 
 
 @app.on_message(filters.command("index_start"))
@@ -1192,7 +1341,9 @@ async def index_start_handler(client: Client, message: Message):
         return await message.reply_text("✅ Database already ready. No indexing needed.")
     import_alive, _ = _proc_status(IMPORT_PID_FILE)
     if import_alive:
-        return await message.reply_text("⚠️ Import is running. Cannot start parallel recovery.")
+        return await message.reply_text("⚠️ Import/index worker is already running.")
+    if ops.matches('recover_indexes_lowram.py'):
+        return await message.reply_text("✅ Index recovery already running. Use /index_status.")
     if not LOOKUP_DB.exists():
         return await message.reply_text("Database missing; cannot recover indexes.")
     meta = _lookup_meta()
@@ -1204,10 +1355,9 @@ async def index_start_handler(client: Client, message: Message):
     if not py.exists():
         return await message.reply_text("Missing venv Python.")
     try:
-        state, pid = await asyncio.to_thread(ops.start, 'index',
-            [str(py), '-u', str(ROOT/'recover_indexes_lowram.py'), '--run'],
-            ops.INDEX_LOG, 'recover_indexes_lowram.py')
+        state, pid = await asyncio.to_thread(_start_index_recovery)
         _ensure_index_watch()
+        _ensure_pipeline_monitor()
         await message.reply_text(f"Index recovery {state}; PID={pid}. Use /index_status.")
     except Exception as e:
         await message.reply_text(f"Recovery start failed: {type(e).__name__}: {e}")
@@ -2029,8 +2179,14 @@ async def bot_main():
     import_alive, _ = _proc_status(IMPORT_PID_FILE)
     if import_alive:
         _ensure_pipeline_monitor()
-    if ops.matches('recover_indexes_lowram.py'):
+    existing_index = ops.matches('recover_indexes_lowram.py')
+    if existing_index:
         _ensure_index_watch()
+        _ensure_pipeline_monitor()
+    elif not import_alive and _lookup_meta().get('phase') == 'indexing':
+        # A previous importer may have been OOM-killed while the bot was down.
+        # Do not touch the source archive; index-only resumption is guarded by a file lock.
+        _ensure_pipeline_monitor()
     for uid in ADMIN_IDS:
         with suppress(Exception):
             await app.send_message(

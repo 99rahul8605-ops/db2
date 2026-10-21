@@ -25,6 +25,16 @@ setup() {
       apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y screen
     else echo 'screen missing; install it first.'; exit 1; fi
   fi
+  if ! command -v 7z >/dev/null && ! command -v 7zz >/dev/null; then
+    if [[ "$(id -u)" == 0 ]] && command -v apt-get >/dev/null; then
+      echo '[setup] Installing 7-Zip for split archives...'
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y p7zip-full || \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y 7zip
+    else
+      echo '7z/7zz missing. Install 7-Zip using your package manager.'; exit 1
+    fi
+  fi
   [[ -f requirements.txt ]] || { echo 'requirements.txt missing'; exit 1; }
   if ! "$ROOT/venv/bin/python3" -c 'import pyrogram,fastapi,uvicorn,ijson,dotenv' >/dev/null 2>&1; then
     echo '[setup] Installing Python dependencies...'
@@ -57,6 +67,21 @@ case "$ACTION" in
   stop)
     if has_screen; then screen -S "$SESSION" -X quit; echo 'Stopped bot screen.'; else echo 'Bot screen not running.'; fi ;;
   restart) "$0" stop; "$0" start ;;
+  tidy)
+    echo '[tidy] Moving legacy .sh files out of project root (not deleting).'
+    backup="$ROOT/.legacy-shell-backup/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup"
+    moved=0
+    for old in install.sh start.sh run_screen.sh start_all.sh start_api.sh \
+               run_api_screen.sh run_import_screen.sh run_manager_screen.sh \
+               start_manager.sh stop.sh stop_all.sh status.sh install_autostart.sh; do
+      if [[ -f "$ROOT/$old" ]]; then
+        mv "$ROOT/$old" "$backup/$old"
+        moved=$((moved+1))
+      fi
+    done
+    echo "[tidy] Moved $moved legacy scripts into $backup"
+    ;;
   foreground) setup; exec "$ROOT/venv/bin/python3" -u "$ROOT/bot.py" ;;
-  *) echo "Usage: bash run.sh [start|setup|status|logs|follow|stop|restart|foreground]"; exit 2 ;;
+  *) echo "Usage: bash run.sh [start|setup|status|logs|follow|stop|restart|foreground|tidy]"; exit 2 ;;
 esac

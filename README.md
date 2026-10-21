@@ -1,122 +1,50 @@
-# Hitek One-Bot Control Panel
+# DB2 Telegram Control Bot (low-memory indexing fix)
 
-One Telegram bot controls the whole workflow: large parallel uploads, 7z validation/extraction, ZIP→SQLite import/indexing, local API process, API keys, and direct lookups.
+A single existing PyroFork admin bot controls uploads, archive validation/extraction, resumable ZIP-to-SQLite import, low-RAM indexing, API and Cloudflare Tunnel processes, monitoring, and API keys. **No database, uploads, passwords, keys, or credentials are included in this ZIP.**
 
-## First install only
+## Installation / update (one shell file)
 
-```bash
-bash install.sh
-nano .env
-./run_screen.sh
-```
-
-## Normal workflow from Telegram
-
-1. `/upload_on` then forward all archive parts.
-2. `/parts` to verify all volumes.
-3. Send:
-
-```text
-/buildall CONFIRM
-```
-
-That single command will:
-
-- turn uploads OFF
-- test/extract the split 7z if `users_data.zip` is not already present
-- start/resume streaming import from `users_data.zip` (the 446 GiB JSON is not separately extracted)
-- build indexes on `mobile`, `alt`, and `id`
-- automatically start the private FastAPI service when indexing finishes
-- notify admins when ready
-
-Import runs as a detached server process, so closing RDP/laptop does not stop it. Its checkpoint is stored in SQLite.
-
-## Bot control commands
-
-```text
-/buildall CONFIRM
-/workflow
-/import_start
-/import_status
-/import_stop CONFIRM
-/api_start
-/api_status
-/api_stop CONFIRM
-/logs import 30
-/logs api 30
-```
-
-Existing upload/key/lookup commands remain available:
-
-```text
-/upload_on /upload_off /queue /retryfailed
-/parts /test7z /extract7z CONFIRM
-/genkey <name> [days|never] /keys /disable /enable
-/lookup <number> /id <record_id> /stats
-```
-
-API binds to `127.0.0.1` by default. API keys are managed by the same Telegram bot.
-
-
-## Public IP:port access
-
-This build can expose the FastAPI service on the server's public IP while keeping every
-lookup endpoint protected by API keys.
-
-From the same Telegram bot:
-
-```text
-/public_on CONFIRM
-/public_url
-/api_status
-```
-
-`/public_url` returns an address like:
-
-```text
-http://203.0.113.10:8080
-```
-
-Remote client example:
+Do **not** update during an active import/index run. Once current `/root/index_recovery.log` shows `SUCCESS`, copy this release's files into `/root/db2`, preserving all runtime data and `.env`.
 
 ```bash
-curl -H "X-API-Key: YOUR_GENERATED_KEY" \
-  "http://SERVER_PUBLIC_IP:8080/lookup?number=9999999891"
+cd /root/db2
+# First upload db2-bot-fixed.zip to /root/db2
+mkdir -p /root/db2-backup
+cp -a bot.py import_users.py recover_indexes_lowram.py ops_control.py run.sh /root/db2-backup/ 2>/dev/null || true
+unzip -oq db2-bot-fixed.zip -d /tmp/db2-bot-fixed
+cp /tmp/db2-bot-fixed/db2-main/*.py /root/db2/
+cp /tmp/db2-bot-fixed/db2-main/requirements.txt /root/db2/
+cp /tmp/db2-bot-fixed/db2-main/run.sh /root/db2/
+bash run.sh restart
 ```
 
-Turn public binding off:
+**Do not overwrite `.env`, `api_keys.db`, `queue.db`, `session/`, `uploads/`, `extracted/`, `lookup/`, tunnel credentials or running screen sessions for API/Tunnel.** One-time optional `bash run.sh tidy` moves old `.sh` files out of the project root into a backup folder. It does not delete data.
 
-```text
-/public_off CONFIRM
+`bash run.sh` (or `bash run.sh start`) creates a missing virtual environment, installs required Python modules, installs `screen` and 7-Zip if necessary, and starts the bot in a background screen. `bash run.sh status`, `logs`, `follow`, `stop`, `restart`, `foreground` are supported. `run.sh` does **not** power on an offline VPS.
+
+## Index fix
+
+- `/buildall CONFIRM`: checks for ready DB or existing indexing checkpoint *before* touching archives. Imports records once; after import, the process **execs** the low-memory index recovery script instead of SQLite's high-RAM index creation.
+- `/import_start`: starts/resumes import, or starts **index-only** recovery if the phase is `indexing`.
+- `/index_start CONFIRM`: manually starts index-only recovery when phase is `indexing`; refuses parallel import.
+- `/index_status`: shows 3 index names, completed status when readable and active **Python** PID; says when database is locked rather than guessing.
+- `/index_logs`, `/import_status`, `/io`: show recovery log, importer log and live read/write MiB/s from actual indexing Python worker.
+- If the importer exits during `indexing`, the bot attempts isolated low-RAM recovery **once** and reports success/failure to Telegram admins. Existing externally started recovery is detected, never duplicated.
+- Each index is separately committed; interrupted jobs skip previously completed indexes. The SQL data is **not re-imported**.
+
+## Other commands
+
+`/control`, `/workflow`, `/public_url`, `/set_public_url https://dbapi.teamsecret.in`, `/test7z`, `/extract7z CONFIRM`, `/parts`, `/upload_on`, `/upload_off`, `/api_start`, `/api_status`, `/api_stop CONFIRM`, `/api_restart`, `/tunnel_start`, `/tunnel_status`, `/tunnel_stop CONFIRM`, `/tunnel_restart`, `/server_status`, `/disk`, `/ram`, `/cleanup` (dry-run), and existing key commands remain.
+
+Cloudflare domain is supplied via `.env` `PUBLIC_API_URL=https://dbapi.teamsecret.in`, or set from Telegram as an admin with `/set_public_url https://dbapi.teamsecret.in` (immediately updates the displayed `/workflow` and `/public_url` values and persists to `.env`). This only affects status display, and must be configured with Cloudflare separately. Tunnel config can be selected with `TUNNEL_CONFIG` in `.env`. Access to sensitive lookup APIs should be limited via HTTPS, Cloudflare Access, admin-only bot controls and tightly scoped API keys.
+
+## Diagnostics
+
+```bash
+bash run.sh status
+bash run.sh logs
+tail -f /root/index_recovery.log
+pidstat -d -p "$(pgrep -f 'python3 -u recover_indexes_lowram.py' | head -1)" 2
 ```
 
-Default `.env.example` settings:
-
-```env
-API_HOST=0.0.0.0
-API_PORT=8080
-RATE_LIMIT_PER_MIN=60
-```
-
-If public-IP auto detection is wrong, set:
-
-```env
-PUBLIC_HOST=YOUR_PUBLIC_IP
-```
-
-### Network/provider firewall
-
-The application can bind to `0.0.0.0:8080`, but your hosting provider may still block
-incoming TCP/8080. In that case, allow TCP port 8080 in the provider firewall/security
-group. Do not open any database files or SQLite ports.
-
-### Security note
-
-API keys are mandatory and can be generated/revoked from the Telegram bot. The API has
-no Swagger/Redoc pages, applies a per-key rate limit, and marks responses `no-store`.
-
-Raw `http://IP:PORT` does **not encrypt the API key or response in transit**. It is okay
-for controlled testing, but HTTPS is safer for use across untrusted networks.
-
-## Single script
-Use `bash run.sh` to prepare venv and launch the bot in a screen session. See `BOT_CONTROL_README.md` for status, logs and restart commands.
+Never re-run `/buildall` or delete the SQLite database during an active recovery. On hosts with less than 1 GiB RAM, index construction can take a long time, and no reliable numeric percentage exists mid-index.

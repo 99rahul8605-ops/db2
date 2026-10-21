@@ -86,7 +86,7 @@ def acquire_instance_lock():
     except BlockingIOError:
         fh.close()
         raise SystemExit(
-            "Another hitek bot instance is already running. Stop it first with ./stop.sh"
+            "Another hitek bot instance is already running. Stop it first with bash run.sh stop"
         )
     _INSTANCE_LOCK_FH = fh
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
@@ -248,7 +248,7 @@ def _start_import():
         return "complete", None
     python = ROOT / "venv" / "bin" / "python3"
     if not python.exists():
-        raise RuntimeError("venv missing; run bash install.sh once")
+        raise RuntimeError("venv missing; run bash run.sh setup once")
     if not ZIP_PATH.exists():
         raise RuntimeError(f"Source ZIP not found: {ZIP_PATH}")
     started, pid = _start_detached([python, ROOT / "import_users.py"], IMPORT_PID_FILE, IMPORT_LOG)
@@ -260,7 +260,7 @@ def _start_api():
         raise RuntimeError("Lookup DB is not fully imported/indexed yet")
     uvicorn = ROOT / "venv" / "bin" / "uvicorn"
     if not uvicorn.exists():
-        raise RuntimeError("uvicorn missing; run bash install.sh once")
+        raise RuntimeError("uvicorn missing; run bash run.sh setup once")
     started, pid = _start_detached(
         [uvicorn, "api:app", "--host", API_HOST, "--port", str(API_PORT), "--workers", "1"],
         API_PID_FILE,

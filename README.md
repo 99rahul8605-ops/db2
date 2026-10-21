@@ -117,3 +117,6 @@ no Swagger/Redoc pages, applies a per-key rate limit, and marks responses `no-st
 
 Raw `http://IP:PORT` does **not encrypt the API key or response in transit**. It is okay
 for controlled testing, but HTTPS is safer for use across untrusted networks.
+
+## Single script
+Use `bash run.sh` to prepare venv and launch the bot in a screen session. See `BOT_CONTROL_README.md` for status, logs and restart commands.

@@ -15,23 +15,21 @@ Maintains the existing PyroFork Telegram bot. All commands require `ADMIN_IDS` m
 | Keys/search | Existing `/genkey`, `/keys`, `/lookup`, `/id`, etc. |
 | Cleanup | `/cleanup` (dry run), `/cleanup_zip CONFIRM` (deletes only source ZIP) |
 
-## Deployment with existing screens (low risk)
+## One-command setup and startup
 
-1. **Back up** your `.env`, `bot.py`, current files, and tunnel config separately. Don't touch `lookup/users_lookup.db`.
-2. Stop **only the bot** screen `hitekbot` during a maintenance window, leaving `lookupapi` and `db2tunnel` running. Extract/copy updated Python/scripts over existing directory, preserving `.env`, session, database, keys, logs, uploads and downloads.
-3. Execute `cd /root/db2 && ./run_screen.sh` to start the updated bot. In Telegram use `/control` and `/tunnel_status`.
-4. The previously started **external** API screen `lookupapi` is not managed by the bot's PID file. Don't use `/api_restart` while it is running; it could conflict with port 8080. Migrate API ownership during a maintenance window or use systemd.
-5. Same for external `db2tunnel` screen: `/tunnel_status` detects it, but `/tunnel_stop` refuses to kill an unowned process. When switching ownership, manually stop old tunnel once, then `/tunnel_start`.
+`bash run.sh` automatically creates a missing `venv`, installs dependencies when needed, checks `.env` and starts `hitekbot` in screen. It does not delete or modify database, API keys, tunnel or old screen sessions.
 
-## Optional startup on reboot (systemd host only)
+```bash
+cd /root/db2
+bash run.sh                 # setup if needed + start bot
+bash run.sh status          # screen status
+bash run.sh logs            # last 70 log lines
+bash run.sh follow          # live log; Ctrl+C only exits log view
+bash run.sh restart         # bot only
+bash run.sh stop            # bot only
+bash run.sh foreground      # debug errors
+```
 
-`sudo bash install_autostart.sh` installs and **enables but does not start** `db2-bot`, `db2-api`, `db2-tunnel`. Avoid starting services until conflicting screens are stopped. If systemd is unavailable (common in Docker/RDP containers), arrange startup using hosting provider's container restart/startup feature; a powered-off host cannot receive Telegram commands. If systemd is used, manage systemd API/tunnel services using `systemctl`, not bot-managed start/stop commands.
+Keep existing `lookupapi` and `db2tunnel` sessions running. Bot operations can control separately managed processes only according to their ownership checks. If this is a new container, the `.env`, sessions, database and tunnel credentials must be restored separately. If host/container is powered off, the bot cannot receive commands; container-level autostart is a separate hosting setting.
 
-## Scope and safety
-
-- Index recovery only runs if metadata phase is `indexing`, not `ready`, and no importer process registered. This protects completed data.
-- `/cleanup_zip CONFIRM` deletes **only** `ZIP_PATH` (when DB ready and no import/indexing). Never cleans databases or sessions.
-- Remote shell execution, automatic backups, cloud credentials management, raw unrestricted SQLite commands and VPS power-on are intentionally excluded.
-- API exposes sensitive personal records. Apply Cloudflare Access, least privilege and HTTPS; revoke previously exposed keys. Do not expose the bot token or `.env`.
-- `io` samples actual Linux `/proc/PID/io` over two seconds. `index_status` reads recovery logs.
-- Existing API on RDP screen will continue regardless of new bot deployment unless manually stopped.
+**Sensitive API:** require Cloudflare Access/restricted access; never publish API keys, bot token or `.env`.
